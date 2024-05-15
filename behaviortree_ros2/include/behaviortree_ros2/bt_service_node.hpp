@@ -187,7 +187,7 @@ protected:
   std::weak_ptr<rclcpp::Node> node_;
   std::string service_name_;
   bool service_name_may_change_ = false;
-  const std::chrono::milliseconds service_timeout_;
+  std::chrono::milliseconds service_timeout_;
   const std::chrono::milliseconds wait_for_service_timeout_;
 
 private:
