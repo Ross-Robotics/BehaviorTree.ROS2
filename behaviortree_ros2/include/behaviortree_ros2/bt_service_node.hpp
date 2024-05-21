@@ -200,6 +200,8 @@ private:
   typename Response::SharedPtr response_;
 
   bool createClient(const std::string& service_name);
+
+  bool checkServiceClient();
 };
 
 //----------------------------------------------------------------
@@ -348,6 +350,10 @@ inline NodeStatus RosServiceNode<T>::tick()
   // first step to be done only at the beginning of the Action
   if(status() == BT::NodeStatus::IDLE)
   {
+    if (!checkServiceClient()) {
+      return CheckStatus(onFailure(SERVICE_UNREACHABLE));
+    }
+
     setStatus(NodeStatus::RUNNING);
 
     response_received_ = false;
@@ -360,12 +366,6 @@ inline NodeStatus RosServiceNode<T>::tick()
     if(!setRequest(request))
     {
       return CheckStatus(onFailure(INVALID_REQUEST));
-    }
-
-    // Check if server is ready
-    if(!srv_instance_->service_client->service_is_ready())
-    {
-      return onFailure(SERVICE_UNREACHABLE);
     }
 
     future_response_ = srv_instance_->service_client->async_send_request(request).share();
@@ -425,6 +425,18 @@ inline void RosServiceNode<T>::halt()
   {
     resetStatus();
   }
+}
+
+template <class T>
+inline bool RosServiceNode<T>::checkServiceClient()
+{
+  bool found = srv_instance_->service_client->wait_for_service(wait_for_service_timeout_);
+  if (!found) {
+    RCLCPP_ERROR(
+      logger(), "%s: Service with name '%s' is not reachable.", name().c_str(),
+      service_name_.c_str());
+  }
+  return found;
 }
 
 }  // namespace BT
