@@ -89,6 +89,11 @@ protected:
   std::string prev_topic_name_;
   bool topic_name_may_change_ = false;
 
+  rclcpp::Logger logger()
+  {
+    return node_->get_logger();
+  }
+
 private:
   std::shared_ptr<Publisher> publisher_;
 
