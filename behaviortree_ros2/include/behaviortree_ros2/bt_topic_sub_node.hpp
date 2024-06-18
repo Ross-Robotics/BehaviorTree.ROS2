@@ -106,6 +106,10 @@ public:
   virtual ~RosTopicSubNode()
   {
     signal_connection_.disconnect();
+    if (sub_instance_)
+    {
+      sub_instance_->subscriber.reset();
+    }
   }
 
   /**

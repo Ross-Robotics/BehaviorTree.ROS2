@@ -97,7 +97,13 @@ public:
   explicit RosActionNode(const std::string& instance_name, const BT::NodeConfig& conf,
                          const RosNodeParams& params);
 
-  virtual ~RosActionNode() = default;
+  virtual ~RosActionNode()
+  {
+    if(client_instance_)
+    {
+      client_instance_.reset();
+    }
+  }
 
   /**
    * @brief Any subclass of RosActionNode that has ports must implement a

@@ -46,7 +46,13 @@ public:
   explicit RosTopicPubNode(const std::string& instance_name, const BT::NodeConfig& conf,
                            const RosNodeParams& params);
 
-  virtual ~RosTopicPubNode() = default;
+  virtual ~RosTopicPubNode()
+  {
+    if (publisher_)
+    {
+      publisher_.reset();
+    }
+  }
 
   /**
    * @brief Any subclass of RosTopicPubNode that has additinal ports must provide a
