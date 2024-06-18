@@ -85,7 +85,13 @@ public:
   explicit RosServiceNode(const std::string& instance_name, const BT::NodeConfig& conf,
                           const BT::RosNodeParams& params);
 
-  virtual ~RosServiceNode() = default;
+  virtual ~RosServiceNode()
+  {
+    if(srv_instance_)
+    {
+      srv_instance_.reset();
+    }
+  }
 
   /**
    * @brief Any subclass of RosServiceNode that has ports must implement a
