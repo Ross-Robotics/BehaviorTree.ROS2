@@ -99,9 +99,15 @@ public:
 
   virtual ~RosActionNode()
   {
-    if(client_instance_)
-    {
+    if (client_instance_) {
       client_instance_.reset();
+      std::unique_lock lk(getMutex());
+      auto& registry = getRegistry();
+      auto it = registry.find(action_client_key_);
+      if (it != registry.end() && it->second.use_count() <= 1) {
+        registry.erase(it);
+        RCLCPP_INFO(logger(), "Removed action client [%s]", action_name_.c_str());
+      }
     }
   }
 
@@ -211,7 +217,7 @@ protected:
   }
 
   using ClientsRegistry =
-      std::unordered_map<std::string, std::weak_ptr<ActionClientInstance>>;
+      std::unordered_map<std::string, std::shared_ptr<ActionClientInstance>>;
   // contains the fully-qualified name of the node and the name of the client
   static ClientsRegistry& getRegistry()
   {
@@ -237,6 +243,8 @@ private:
   WrappedResult result_;
 
   bool createClient(const std::string& action_name);
+
+  bool checkActionClient();
 };
 
 //----------------------------------------------------------------
@@ -331,26 +339,22 @@ inline bool RosActionNode<T>::createClient(const std::string& action_name)
 
   auto& registry = getRegistry();
   auto it = registry.find(action_client_key_);
-  if(it == registry.end() || it->second.expired())
+  if(it == registry.end())
   {
     client_instance_ = std::make_shared<ActionClientInstance>(node, action_name);
     registry.insert({ action_client_key_, client_instance_ });
+
+    RCLCPP_INFO(logger(), "Node [%s] created action client [%s]", name().c_str(),
+                action_name.c_str());
   }
   else
   {
-    client_instance_ = it->second.lock();
+    client_instance_ = it->second;
   }
 
   action_name_ = action_name;
 
-  bool found =
-      client_instance_->action_client->wait_for_action_server(wait_for_server_timeout_);
-  if(!found)
-  {
-    RCLCPP_ERROR(logger(), "%s: Action server with name '%s' is not reachable.",
-                 name().c_str(), action_name_.c_str());
-  }
-  return found;
+  return true;
 }
 
 template <class T>
@@ -572,6 +576,19 @@ inline void RosActionNode<T>::cancelGoal()
     RCLCPP_ERROR(logger(), "Failed to get result call failed :( for [%s]",
                  action_name_.c_str());
   }
+}
+
+template <class T>
+inline bool RosActionNode<T>::checkActionClient()
+{
+  bool found =
+    client_instance_->action_client->wait_for_action_server(wait_for_server_timeout_);
+  if (!found) {
+    RCLCPP_ERROR(
+      logger(), "%s: Action server with name '%s' is not reachable.", name().c_str(),
+      action_name_.c_str());
+  }
+  return found;
 }
 
 }  // namespace BT

@@ -48,9 +48,15 @@ public:
 
   virtual ~RosTopicPubNode()
   {
-    if (publisher_)
-    {
-      publisher_.reset();
+    if (publisher_instance_) {
+      publisher_instance_.reset();
+      std::unique_lock lk(registryMutex());
+      auto& registry = getRegistry();
+      auto it = registry.find(publisher_key_);
+      if (it != registry.end() && it->second.use_count() <= 1) {
+        registry.erase(it);
+        RCLCPP_INFO(logger(), "Remove publisher [%s]", topic_name_.c_str());
+      }
     }
   }
 
@@ -91,25 +97,60 @@ public:
   virtual bool setMessage(TopicT& msg) = 0;
 
 protected:
-  std::shared_ptr<rclcpp::Node> node_;
-  std::string prev_topic_name_;
+  struct PublisherInstance
+  {
+    void init(std::shared_ptr<rclcpp::Node> node, const std::string& topic_name)
+    {
+      publisher = node->create_publisher<TopicT>(topic_name, 1);
+    }
+    std::shared_ptr<Publisher> publisher;
+  };
+
+  static std::mutex& registryMutex()
+  {
+    static std::mutex pub_mutex;
+    return pub_mutex;
+  }
+
+  using PubliserRegistry = std::unordered_map<std::string, std::shared_ptr<PublisherInstance>>;
+  // contains the fully-qualified name of the node and the name of the topic
+  static PubliserRegistry& getRegistry()
+  {
+    static PubliserRegistry publishers_registry;
+    return publishers_registry;
+  }
+
+  std::weak_ptr<rclcpp::Node> node_;
+  std::string topic_name_;
   bool topic_name_may_change_ = false;
+  std::string publisher_key_;
+  std::shared_ptr<PublisherInstance> publisher_instance_ = nullptr;
 
   rclcpp::Logger logger()
   {
-    return node_->get_logger();
+    if(auto node = node_.lock())
+    {
+      return node->get_logger();
+    }
+    return rclcpp::get_logger("RosTopicSubNode");
+  }
+
+  rclcpp::Time now()
+  {
+    if(auto node = node_.lock())
+    {
+      return node->now();
+    }
+    return rclcpp::Clock(RCL_ROS_TIME).now();
   }
 
 private:
-  std::shared_ptr<Publisher> publisher_;
-
   bool createPublisher(const std::string& topic_name);
 };
 
 //----------------------------------------------------------------
 //---------------------- DEFINITIONS -----------------------------
 //----------------------------------------------------------------
-
 template <class T>
 inline RosTopicPubNode<T>::RosTopicPubNode(const std::string& instance_name,
                                            const NodeConfig& conf,
@@ -169,8 +210,29 @@ inline bool RosTopicPubNode<T>::createPublisher(const std::string& topic_name)
     throw RuntimeError("topic_name is empty");
   }
 
-  publisher_ = node_->create_publisher<T>(topic_name, 1);
-  prev_topic_name_ = topic_name;
+  std::unique_lock lk(registryMutex());
+  auto node = node_.lock();
+  if(!node)
+  {
+    throw RuntimeError("The ROS node went out of scope. RosNodeParams doesn't take the "
+                       "ownership of the node.");
+  }
+  publisher_key_ = std::string(node->get_fully_qualified_name()) + "/" + topic_name;
+
+  auto& registry = getRegistry();
+  auto it = registry.find(publisher_key_);
+  if (it == registry.end()) {
+    it = registry.insert({publisher_key_, std::make_shared<PublisherInstance>()}).first;
+    publisher_instance_ = it->second;
+    publisher_instance_->init(node, topic_name);
+
+    RCLCPP_INFO(
+      logger(), "Node [%s] created publisher topic [%s]", name().c_str(), topic_name.c_str());
+  } else {
+    publisher_instance_ = it->second;
+  }
+
+  topic_name_ = topic_name;
   return true;
 }
 
@@ -180,12 +242,13 @@ inline NodeStatus RosTopicPubNode<T>::tick()
   // First, check if the subscriber_ is valid and that the name of the
   // topic_name in the port didn't change.
   // otherwise, create a new subscriber
-  if(!publisher_ || (status() == NodeStatus::IDLE && topic_name_may_change_))
+  if(!publisher_instance_ || (status() == NodeStatus::IDLE && topic_name_may_change_))
   {
     std::string topic_name;
     getInput("topic_name", topic_name);
-    if(prev_topic_name_ != topic_name)
+    if(topic_name_ != topic_name)
     {
+      RCLCPP_INFO(logger(), "createPublisher");
       createPublisher(topic_name);
     }
   }
@@ -195,7 +258,7 @@ inline NodeStatus RosTopicPubNode<T>::tick()
   {
     return NodeStatus::FAILURE;
   }
-  publisher_->publish(msg);
+  publisher_instance_->publisher->publish(msg);
   return NodeStatus::SUCCESS;
 }
 

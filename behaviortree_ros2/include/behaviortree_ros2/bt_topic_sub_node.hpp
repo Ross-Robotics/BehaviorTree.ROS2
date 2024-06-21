@@ -51,7 +51,7 @@ public:
 protected:
   struct SubscriberInstance
   {
-    SubscriberInstance(std::shared_ptr<rclcpp::Node> node, const std::string& topic_name, rclcpp::QoS qos);
+    SubscriberInstance(std::shared_ptr<rclcpp::Node> node, const std::string& topic_name);
 
     std::shared_ptr<Subscriber> subscriber;
     rclcpp::CallbackGroup::SharedPtr callback_group;
@@ -67,7 +67,7 @@ protected:
   }
 
   using SubscribersRegistry =
-      std::unordered_map<std::string, std::weak_ptr<SubscriberInstance>>;
+      std::unordered_map<std::string, std::shared_ptr<SubscriberInstance>>;
 
   // contains the fully-qualified name of the node and the name of the topic
   static SubscribersRegistry& getRegistry()
@@ -106,9 +106,17 @@ public:
   virtual ~RosTopicSubNode()
   {
     signal_connection_.disconnect();
-    if (sub_instance_)
-    {
-      sub_instance_->subscriber.reset();
+    if (sub_instance_) {
+      sub_instance_.reset();
+      std::unique_lock lk(registryMutex());
+      auto& registry = getRegistry();
+      auto it = registry.find(subscriber_key_);
+      // when the reference count is 1, means that the only instance is owned by the
+      // registry itself. Delete it
+      if (it != registry.end() && it->second.use_count() <= 1) {
+        registry.erase(it);
+        RCLCPP_INFO(logger(), "Remove subscriber [%s]", topic_name_.c_str());
+      }
     }
   }
 
@@ -121,10 +129,7 @@ public:
   static PortsList providedBasicPorts(PortsList addition)
   {
     PortsList basic = { InputPort<std::string>("topic_name", "__default__placeholder__",
-                                               "Topic name"),
-                        InputPort<std::string>("reliability_policy", "reliable","__default_reliability__"),
-                        InputPort<std::string>("durability_policy", "volatile","__default_durability__"),
-                        InputPort<int>("keep_last_policy", 10,"__default_keep_last__")};
+                                               "Topic name")};
     basic.insert(addition.begin(), addition.end());
     return basic;
   }
@@ -163,9 +168,7 @@ public:
   }
 
 private:
-  bool createSubscriber(const std::string& topic_name, rclcpp::QoS qos = rclcpp::QoS(10));
-  rclcpp::QoS generate_qos(const std::string& reliability_policy,
-                           const std::string& durability_policy, int keep_last_policy);
+  bool createSubscriber(const std::string& topic_name);
 };
 
 //----------------------------------------------------------------
@@ -173,7 +176,7 @@ private:
 //----------------------------------------------------------------
 template <class T>
 inline RosTopicSubNode<T>::SubscriberInstance::SubscriberInstance(
-    std::shared_ptr<rclcpp::Node> node, const std::string& topic_name, rclcpp::QoS qos)
+    std::shared_ptr<rclcpp::Node> node, const std::string& topic_name)
 {
   // create a callback group for this particular instance
   callback_group =
@@ -189,7 +192,10 @@ inline RosTopicSubNode<T>::SubscriberInstance::SubscriberInstance(
     last_msg = msg;
     broadcaster(msg);
   };
-  subscriber = node->create_subscription<T>(topic_name, qos, callback, option);
+  rclcpp::QoS qos_local(rclcpp::KeepLast(1));
+  qos_local.reliability(rclcpp::ReliabilityPolicy::BestEffort);
+  qos_local.durability(rclcpp::DurabilityPolicy::Volatile);
+  subscriber = node->create_subscription<T>(topic_name, qos_local, callback, option);
 }
 
 template <class T>
@@ -244,7 +250,7 @@ inline RosTopicSubNode<T>::RosTopicSubNode(const std::string& instance_name,
 }
 
 template <class T>
-inline bool RosTopicSubNode<T>::createSubscriber(const std::string& topic_name, rclcpp::QoS qos)
+inline bool RosTopicSubNode<T>::createSubscriber(const std::string& topic_name)
 {
   if(topic_name.empty())
   {
@@ -266,15 +272,11 @@ inline bool RosTopicSubNode<T>::createSubscriber(const std::string& topic_name, 
   }
   subscriber_key_ = std::string(node->get_fully_qualified_name()) + "/" + topic_name;
 
-  rclcpp::QoS qos_local(rclcpp::KeepLast(1));
-  qos_local.reliability(rclcpp::ReliabilityPolicy::BestEffort);
-  qos_local.durability(rclcpp::DurabilityPolicy::Volatile);
-
   auto& registry = getRegistry();
   auto it = registry.find(subscriber_key_);
-  if(it == registry.end() || it->second.expired())
+  if(it == registry.end())
   {
-    sub_instance_ = std::make_shared<SubscriberInstance>(node, topic_name, qos_local);
+    sub_instance_ = std::make_shared<SubscriberInstance>(node, topic_name);
     registry.insert({ subscriber_key_, sub_instance_ });
 
     RCLCPP_INFO(logger(), "Node [%s] created Subscriber to topic [%s]", name().c_str(),
@@ -282,7 +284,7 @@ inline bool RosTopicSubNode<T>::createSubscriber(const std::string& topic_name, 
   }
   else
   {
-    sub_instance_ = it->second.lock();
+    sub_instance_ = it->second;
   }
 
   // Check if there was a message received before the creation of this subscriber action
@@ -308,18 +310,6 @@ inline NodeStatus RosTopicSubNode<T>::tick()
   std::string topic_name;
   getInput("topic_name", topic_name);
 
-  std::string reliability_policy;
-  getInput("reliability_policy", reliability_policy);
-
-  std::string durability_policy;
-  getInput("durability_policy", durability_policy);
-
-  int keep_last_policy;
-  getInput("keep_last_policy", keep_last_policy);
-
-  rclcpp::QoS qos = generate_qos(reliability_policy, durability_policy, keep_last_policy);
-
-
   if(!topic_name.empty() && topic_name != "__default__placeholder__" &&
      topic_name != topic_name_)
   {
@@ -328,7 +318,7 @@ inline NodeStatus RosTopicSubNode<T>::tick()
 
   if(!sub_instance_)
   {
-    createSubscriber(topic_name, qos);
+    createSubscriber(topic_name);
   }
 
   auto CheckStatus = [](NodeStatus status) {
@@ -346,41 +336,5 @@ inline NodeStatus RosTopicSubNode<T>::tick()
     last_msg_.reset();
   }
   return status;
-}
-
-template <class T>
-inline rclcpp::QoS RosTopicSubNode<T>::generate_qos(const std::string& reliability_policy,
-                         const std::string& durability_policy, int keep_last_policy)
-{
-  rclcpp::QoS qos(1);
-
-  qos.keep_last(keep_last_policy);
-  if(reliability_policy == "best_effort")
-  {
-    qos.reliability(rclcpp::ReliabilityPolicy::BestEffort);
-  }
-  else if(reliability_policy == "reliable")
-  {
-    qos.reliability(rclcpp::ReliabilityPolicy::Reliable);
-  }
-  else
-  {
-    throw std::logic_error("Invalid reliability policy");
-  }
-
-  if(durability_policy == "transient_local")
-  {
-    qos.durability(rclcpp::DurabilityPolicy::TransientLocal);
-  }
-  else if(durability_policy == "volatile")
-  {
-    qos.durability(rclcpp::DurabilityPolicy::Volatile);
-  }
-  else
-  {
-    throw std::logic_error("Invalid durability policy");
-  }
-
-  return qos;
 }
 }  // namespace BT
