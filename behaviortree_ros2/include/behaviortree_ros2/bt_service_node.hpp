@@ -85,7 +85,20 @@ public:
   explicit RosServiceNode(const std::string& instance_name, const BT::NodeConfig& conf,
                           const BT::RosNodeParams& params);
 
-  virtual ~RosServiceNode() = default;
+  virtual ~RosServiceNode()
+  {
+    if (srv_instance_) {
+      srv_instance_.reset();
+      std::unique_lock lk(getMutex());
+      auto& registry = getRegistry();
+      auto it = registry.find(service_client_key_);
+
+      if (it != registry.end() && it->second.use_count() <= 1) {
+        registry.erase(it);
+        RCLCPP_INFO(logger(), "Remove service [%s]", service_name_.c_str());
+      }
+    }
+  }
 
   /**
    * @brief Any subclass of RosServiceNode that has ports must implement a
@@ -176,7 +189,7 @@ protected:
   }
 
   using ClientsRegistry =
-      std::unordered_map<std::string, std::weak_ptr<ServiceClientInstance>>;
+      std::unordered_map<std::string, std::shared_ptr<ServiceClientInstance>>;
   // contains the fully-qualified name of the node and the name of the client
   static ClientsRegistry& getRegistry()
   {
@@ -185,13 +198,13 @@ protected:
   }
 
   std::weak_ptr<rclcpp::Node> node_;
+  std::shared_ptr<ServiceClientInstance> srv_instance_ = nullptr;
   std::string service_name_;
   bool service_name_may_change_ = false;
-  const std::chrono::milliseconds service_timeout_;
+  std::chrono::milliseconds service_timeout_;
   const std::chrono::milliseconds wait_for_service_timeout_;
-
+  std::string service_client_key_;
 private:
-  std::shared_ptr<ServiceClientInstance> srv_instance_;
   std::shared_future<typename Response::SharedPtr> future_response_;
 
   rclcpp::Time time_request_sent_;
@@ -200,6 +213,8 @@ private:
   typename Response::SharedPtr response_;
 
   bool createClient(const std::string& service_name);
+
+  bool checkServiceClient();
 };
 
 //----------------------------------------------------------------
@@ -287,31 +302,25 @@ inline bool RosServiceNode<T>::createClient(const std::string& service_name)
     throw RuntimeError("The ROS node went out of scope. RosNodeParams doesn't take the "
                        "ownership of the node.");
   }
-  auto client_key = std::string(node->get_fully_qualified_name()) + "/" + service_name;
+  service_client_key_ = std::string(node->get_fully_qualified_name()) + "/" + service_name;
 
   auto& registry = getRegistry();
-  auto it = registry.find(client_key);
-  if(it == registry.end() || it->second.expired())
+  auto it = registry.find(service_client_key_);
+  if(it == registry.end())
   {
     srv_instance_ = std::make_shared<ServiceClientInstance>(node, service_name);
-    registry.insert({ client_key, srv_instance_ });
+    registry.insert({ service_client_key_, srv_instance_ });
 
     RCLCPP_INFO(logger(), "Node [%s] created service client [%s]", name().c_str(),
                 service_name.c_str());
   }
   else
   {
-    srv_instance_ = it->second.lock();
+    srv_instance_ = it->second;
   }
   service_name_ = service_name;
 
-  bool found = srv_instance_->service_client->wait_for_service(wait_for_service_timeout_);
-  if(!found)
-  {
-    RCLCPP_ERROR(logger(), "%s: Service with name '%s' is not reachable.", name().c_str(),
-                 service_name_.c_str());
-  }
-  return found;
+  return true;
 }
 
 template <class T>
@@ -348,6 +357,10 @@ inline NodeStatus RosServiceNode<T>::tick()
   // first step to be done only at the beginning of the Action
   if(status() == BT::NodeStatus::IDLE)
   {
+    if (!checkServiceClient()) {
+      return CheckStatus(onFailure(SERVICE_UNREACHABLE));
+    }
+
     setStatus(NodeStatus::RUNNING);
 
     response_received_ = false;
@@ -360,12 +373,6 @@ inline NodeStatus RosServiceNode<T>::tick()
     if(!setRequest(request))
     {
       return CheckStatus(onFailure(INVALID_REQUEST));
-    }
-
-    // Check if server is ready
-    if(!srv_instance_->service_client->service_is_ready())
-    {
-      return onFailure(SERVICE_UNREACHABLE);
     }
 
     future_response_ = srv_instance_->service_client->async_send_request(request).share();
@@ -425,6 +432,18 @@ inline void RosServiceNode<T>::halt()
   {
     resetStatus();
   }
+}
+
+template <class T>
+inline bool RosServiceNode<T>::checkServiceClient()
+{
+  bool found = srv_instance_->service_client->wait_for_service(wait_for_service_timeout_);
+  if (!found) {
+    RCLCPP_ERROR(
+      logger(), "%s: Service with name '%s' is not reachable.", name().c_str(),
+      service_name_.c_str());
+  }
+  return found;
 }
 
 }  // namespace BT

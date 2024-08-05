@@ -67,7 +67,7 @@ protected:
   }
 
   using SubscribersRegistry =
-      std::unordered_map<std::string, std::weak_ptr<SubscriberInstance>>;
+      std::unordered_map<std::string, std::shared_ptr<SubscriberInstance>>;
 
   // contains the fully-qualified name of the node and the name of the topic
   static SubscribersRegistry& getRegistry()
@@ -106,6 +106,18 @@ public:
   virtual ~RosTopicSubNode()
   {
     signal_connection_.disconnect();
+    if (sub_instance_) {
+      sub_instance_.reset();
+      std::unique_lock lk(registryMutex());
+      auto& registry = getRegistry();
+      auto it = registry.find(subscriber_key_);
+      // when the reference count is 1, means that the only instance is owned by the
+      // registry itself. Delete it
+      if (it != registry.end() && it->second.use_count() <= 1) {
+        registry.erase(it);
+        RCLCPP_INFO(logger(), "Remove subscriber [%s]", topic_name_.c_str());
+      }
+    }
   }
 
   /**
@@ -117,7 +129,7 @@ public:
   static PortsList providedBasicPorts(PortsList addition)
   {
     PortsList basic = { InputPort<std::string>("topic_name", "__default__placeholder__",
-                                               "Topic name") };
+                                               "Topic name")};
     basic.insert(addition.begin(), addition.end());
     return basic;
   }
@@ -180,7 +192,10 @@ inline RosTopicSubNode<T>::SubscriberInstance::SubscriberInstance(
     last_msg = msg;
     broadcaster(msg);
   };
-  subscriber = node->create_subscription<T>(topic_name, 1, callback, option);
+  rclcpp::QoS qos_local(rclcpp::KeepLast(1));
+  qos_local.reliability(rclcpp::ReliabilityPolicy::BestEffort);
+  qos_local.durability(rclcpp::DurabilityPolicy::Volatile);
+  subscriber = node->create_subscription<T>(topic_name, qos_local, callback, option);
 }
 
 template <class T>
@@ -259,7 +274,7 @@ inline bool RosTopicSubNode<T>::createSubscriber(const std::string& topic_name)
 
   auto& registry = getRegistry();
   auto it = registry.find(subscriber_key_);
-  if(it == registry.end() || it->second.expired())
+  if(it == registry.end())
   {
     sub_instance_ = std::make_shared<SubscriberInstance>(node, topic_name);
     registry.insert({ subscriber_key_, sub_instance_ });
@@ -269,7 +284,7 @@ inline bool RosTopicSubNode<T>::createSubscriber(const std::string& topic_name)
   }
   else
   {
-    sub_instance_ = it->second.lock();
+    sub_instance_ = it->second;
   }
 
   // Check if there was a message received before the creation of this subscriber action
@@ -322,5 +337,4 @@ inline NodeStatus RosTopicSubNode<T>::tick()
   }
   return status;
 }
-
 }  // namespace BT
