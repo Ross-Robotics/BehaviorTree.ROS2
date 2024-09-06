@@ -501,7 +501,6 @@ inline NodeStatus RosActionNode<T>::tick()
       return on_feedback_state_change_;
     }
     // THIRD case: result received, requested a stop
-    RCLCPP_INFO(logger(), "result_.code: %d", result_.code);
     if(result_.code != rclcpp_action::ResultCode::UNKNOWN)
     {
       if(result_.code == rclcpp_action::ResultCode::ABORTED)
