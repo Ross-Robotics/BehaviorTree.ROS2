@@ -229,7 +229,7 @@ protected:
   std::shared_ptr<ActionClientInstance> client_instance_;
   std::string action_name_;
   bool action_name_may_change_ = false;
-  const std::chrono::milliseconds server_timeout_;
+  std::chrono::milliseconds server_timeout_;
   const std::chrono::milliseconds wait_for_server_timeout_;
   std::string action_client_key_;
 
@@ -472,8 +472,10 @@ inline NodeStatus RosActionNode<T>::tick()
 
       auto ret = client_instance_->callback_executor.spin_until_future_complete(
           future_goal_handle_, nodelay);
+      RCLCPP_INFO(logger(), "Action [%s] Future completed", action_name_.c_str());
       if(ret != rclcpp::FutureReturnCode::SUCCESS)
       {
+        RCLCPP_INFO(logger(), "Action [%s] Goal request failed", action_name_.c_str());
         if((now() - time_goal_sent_) > timeout)
         {
           RCLCPP_INFO(logger(), "Action [%s] Goal request timed out", action_name_.c_str());
@@ -481,6 +483,7 @@ inline NodeStatus RosActionNode<T>::tick()
         }
         else
         {
+          RCLCPP_INFO(logger(), "Action [%s] Goal request still pending", action_name_.c_str());
           return NodeStatus::RUNNING;
         }
       }
