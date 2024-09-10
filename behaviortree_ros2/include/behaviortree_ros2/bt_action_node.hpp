@@ -436,7 +436,7 @@ inline NodeStatus RosActionNode<T>::tick()
           if(!goal_handle_)
           {
             RCLCPP_ERROR(logger(), "Goal for [%s] was rejected by server", action_name_.c_str());
-            return onFailure(GOAL_REJECTED_BY_SERVER);  // return not needed technically
+            // return onFailure(GOAL_REJECTED_BY_SERVER);  // return not needed technically
           }
           else
           {
@@ -460,10 +460,12 @@ inline NodeStatus RosActionNode<T>::tick()
   {
     std::unique_lock<std::mutex> lock(getMutex());
     client_instance_->callback_executor.spin_some();
+    RCLCPP_INFO(logger(), "Action [%s] is running", action_name_.c_str());
 
     // FIRST case: check if the goal request has a timeout
     if(!goal_received_)
     {
+      RCLCPP_INFO(logger(), "Action [%s] Waiting for goal to be received", action_name_.c_str());
       auto nodelay = std::chrono::milliseconds(0);
       auto timeout =
           rclcpp::Duration::from_seconds(double(server_timeout_.count()) / 1000);
@@ -474,6 +476,7 @@ inline NodeStatus RosActionNode<T>::tick()
       {
         if((now() - time_goal_sent_) > timeout)
         {
+          RCLCPP_INFO(logger(), "Action [%s] Goal request timed out", action_name_.c_str());
           return CheckStatus(onFailure(SEND_GOAL_TIMEOUT));
         }
         else
@@ -483,6 +486,7 @@ inline NodeStatus RosActionNode<T>::tick()
       }
       else
       {
+        RCLCPP_INFO(logger(), "Action [%s] Goal received", action_name_.c_str());
         goal_received_ = true;
         goal_handle_ = future_goal_handle_.get();
         future_goal_handle_ = {};
@@ -497,6 +501,7 @@ inline NodeStatus RosActionNode<T>::tick()
     // SECOND case: onFeedback requested a stop
     if(on_feedback_state_change_ != NodeStatus::RUNNING)
     {
+      RCLCPP_INFO(logger(), "Action [%s] onFeedback requested a stop", action_name_.c_str());
       cancelGoal();
       return on_feedback_state_change_;
     }
@@ -505,14 +510,17 @@ inline NodeStatus RosActionNode<T>::tick()
     {
       if(result_.code == rclcpp_action::ResultCode::ABORTED)
       {
+        RCLCPP_INFO(logger(), "Action [%s] Received result but aborted", action_name_.c_str());
         return CheckStatus(onFailure(ACTION_ABORTED));
       }
       else if(result_.code == rclcpp_action::ResultCode::CANCELED)
       {
+        RCLCPP_INFO(logger(), "Action [%s] Received result but cancelled", action_name_.c_str());
         return CheckStatus(onFailure(ACTION_CANCELLED));
       }
       else
       {
+        RCLCPP_INFO(logger(), "Action [%s] Received result with code %d", action_name_.c_str(), result_.code);
         return CheckStatus(onResultReceived(result_));
       }
     }
