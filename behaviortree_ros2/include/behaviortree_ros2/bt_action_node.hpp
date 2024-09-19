@@ -236,11 +236,13 @@ protected:
 private:
   std::shared_future<typename GoalHandle::SharedPtr> future_goal_handle_;
   typename GoalHandle::SharedPtr goal_handle_;
-
+  std::mutex goal_handle_mutex_;
   rclcpp::Time time_goal_sent_;
   NodeStatus on_feedback_state_change_;
+  std::mutex on_feedback_state_change_mutex_;
   bool goal_received_;
   WrappedResult result_;
+  std::mutex result_mutex_;
 
   bool createClient(const std::string& action_name);
 
@@ -413,6 +415,7 @@ inline NodeStatus RosActionNode<T>::tick()
     goal_options.feedback_callback =
         [this](typename GoalHandle::SharedPtr,
                const std::shared_ptr<const Feedback> feedback) {
+          std::lock_guard<std::mutex> lock(on_feedback_state_change_mutex_);
           on_feedback_state_change_ = onFeedback(feedback);
           if(on_feedback_state_change_ == NodeStatus::IDLE)
           {
@@ -422,8 +425,15 @@ inline NodeStatus RosActionNode<T>::tick()
         };
     //--------------------
     goal_options.result_callback = [this](const WrappedResult& result) {
+      std::lock_guard<std::mutex> lock(goal_handle_mutex_);
+      if (!goal_handle_) {
+        RCLCPP_WARN(logger(), "Received result but goal handle is invalid.");
+        return;
+      }
+
       if(goal_handle_->get_goal_id() == result.goal_id)
       {
+        std::lock_guard<std::mutex> lock(result_mutex_);
         RCLCPP_DEBUG(logger(), "result_callback");
         result_ = result;
         emitWakeUpSignal();
@@ -432,6 +442,7 @@ inline NodeStatus RosActionNode<T>::tick()
     //--------------------
     goal_options.goal_response_callback =
         [this](typename GoalHandle::SharedPtr const future_handle) {
+          std::lock_guard<std::mutex> lock(goal_handle_mutex_);
           auto goal_handle_ = future_handle.get();
           if(!goal_handle_)
           {
