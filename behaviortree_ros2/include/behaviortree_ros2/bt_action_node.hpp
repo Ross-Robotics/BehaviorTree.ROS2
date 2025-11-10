@@ -17,6 +17,7 @@
 
 #include <memory>
 #include <string>
+#include <optional>
 #include <rclcpp/executors.hpp>
 #include <rclcpp/allocator/allocator_common.hpp>
 #include "behaviortree_cpp/action_node.h"
@@ -115,13 +116,16 @@ public:
    * @brief Any subclass of RosActionNode that has ports must implement a
    * providedPorts method and call providedBasicPorts in it.
    *
+   * The basic ports:
+   *
+   * - `action_name` Action server name
+   *
    * @param addition Additional ports to add to BT port list
    * @return PortsList containing basic ports along with node-specific ports
    */
   static PortsList providedBasicPorts(PortsList addition)
   {
-    PortsList basic = { InputPort<std::string>("action_name", "__default__placeholder__",
-                                               "Action server name") };
+    PortsList basic = { InputPort<std::string>("action_name", "", "Action server name") };
     basic.insert(addition.begin(), addition.end());
     return basic;
   }
@@ -165,8 +169,15 @@ public:
   }
 
   /** Callback invoked when something goes wrong.
+   * The result is provided if it is available.
    * It must return either SUCCESS or FAILURE.
    */
+  virtual BT::NodeStatus onFailure(ActionNodeErrorCode error,
+                                   const std::optional<WrappedResult>&)
+  {
+    return onFailure(error);
+  }
+
   virtual BT::NodeStatus onFailure(ActionNodeErrorCode /*error*/)
   {
     return NodeStatus::FAILURE;
@@ -176,9 +187,12 @@ public:
   void cancelGoal();
 
   /// The default halt() implementation will call cancelGoal if necessary.
-  void halt() override final;
+  void halt() override;
 
-  NodeStatus tick() override final;
+  NodeStatus tick() override;
+
+  /// Can be used to change the name of the action programmatically
+  void setActionName(const std::string& action_name);
 
 protected:
   struct ActionClientInstance
@@ -228,8 +242,8 @@ protected:
   std::weak_ptr<rclcpp::Node> node_;
   std::shared_ptr<ActionClientInstance> client_instance_;
   std::string action_name_;
-  bool action_name_may_change_ = false;
-  std::chrono::milliseconds server_timeout_;
+  bool action_name_should_be_checked_ = false;
+  const std::chrono::milliseconds server_timeout_;
   const std::chrono::milliseconds wait_for_server_timeout_;
   std::string action_client_key_;
 
@@ -258,7 +272,7 @@ RosActionNode<T>::ActionClientInstance::ActionClientInstance(
     std::shared_ptr<rclcpp::Node> node, const std::string& action_name)
 {
   callback_group =
-      node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+      node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
   callback_executor.add_callback_group(callback_group, node->get_node_base_interface());
   action_client = rclcpp_action::create_client<T>(node, action_name, callback_group);
 }
@@ -281,44 +295,23 @@ inline RosActionNode<T>::RosActionNode(const std::string& instance_name,
   auto portIt = config().input_ports.find("action_name");
   if(portIt != config().input_ports.end())
   {
-    const std::string& bb_action_name = portIt->second;
+    const std::string& bb_service_name = portIt->second;
 
-    if(bb_action_name.empty() || bb_action_name == "__default__placeholder__")
+    if(isBlackboardPointer(bb_service_name))
     {
-      if(params.default_port_value.empty())
-      {
-        throw std::logic_error("Both [action_name] in the InputPort and the "
-                               "RosNodeParams are empty.");
-      }
-      else
-      {
-        createClient(params.default_port_value);
-      }
+      // unknown value at construction time. Postpone to tick
+      action_name_should_be_checked_ = true;
     }
-    else if(!isBlackboardPointer(bb_action_name))
+    else if(!bb_service_name.empty())
     {
-      // If the content of the port "action_name" is not
-      // a pointer to the blackboard, but a static string, we can
-      // create the client in the constructor.
-      createClient(bb_action_name);
-    }
-    else
-    {
-      action_name_may_change_ = true;
-      // createClient will be invoked in the first tick().
+      // "hard-coded" name in the bb_service_name. Use it.
+      createClient(bb_service_name);
     }
   }
-  else
+  // no port value or it is empty. Use the default value
+  if(!client_instance_ && !params.default_port_value.empty())
   {
-    if(params.default_port_value.empty())
-    {
-      throw std::logic_error("Both [action_name] in the InputPort and the RosNodeParams "
-                             "are empty.");
-    }
-    else
-    {
-      createClient(params.default_port_value);
-    }
+    createClient(params.default_port_value);
   }
 }
 
@@ -344,10 +337,7 @@ inline bool RosActionNode<T>::createClient(const std::string& action_name)
   if(it == registry.end())
   {
     client_instance_ = std::make_shared<ActionClientInstance>(node, action_name);
-    registry.insert({ action_client_key_, client_instance_ });
-
-    RCLCPP_INFO(logger(), "Node [%s] created action client [%s]", name().c_str(),
-                action_name.c_str());
+    registry.insert_or_assign(action_client_key_, client_instance_);
   }
   else
   {
@@ -357,6 +347,13 @@ inline bool RosActionNode<T>::createClient(const std::string& action_name)
   action_name_ = action_name;
 
   return true;
+}
+
+template <class T>
+inline void RosActionNode<T>::setActionName(const std::string& action_name)
+{
+  action_name_ = action_name;
+  createClient(action_name);
 }
 
 template <class T>
@@ -371,7 +368,8 @@ inline NodeStatus RosActionNode<T>::tick()
   // First, check if the action_client_ is valid and that the name of the
   // action_name in the port didn't change.
   // otherwise, create a new client
-  if(!client_instance_ || (status() == NodeStatus::IDLE && action_name_may_change_))
+  if(!client_instance_ ||
+     (status() == NodeStatus::IDLE && action_name_should_be_checked_))
   {
     std::string action_name;
     getInput("action_name", action_name);
@@ -380,6 +378,13 @@ inline NodeStatus RosActionNode<T>::tick()
       createClient(action_name);
     }
   }
+
+  if(!client_instance_)
+  {
+    throw BT::RuntimeError("RosActionNode: no client was specified, neither as default "
+                           "nor in the ports");
+  }
+
   auto& action_client = client_instance_->action_client;
 
   //------------------------------------------
@@ -406,7 +411,7 @@ inline NodeStatus RosActionNode<T>::tick()
 
     if(!setGoal(goal))
     {
-      return CheckStatus(onFailure(INVALID_GOAL));
+      return CheckStatus(onFailure(INVALID_GOAL, {}));
     }
 
     typename ActionClient::SendGoalOptions goal_options;
@@ -446,8 +451,8 @@ inline NodeStatus RosActionNode<T>::tick()
           auto goal_handle_ = future_handle.get();
           if(!goal_handle_)
           {
-            RCLCPP_ERROR(logger(), "Goal for [%s] was rejected by server", action_name_.c_str());
-            return onFailure(GOAL_REJECTED_BY_SERVER);  // return not needed technically
+            RCLCPP_ERROR(logger(), "Goal was rejected by server");
+            return onFailure(GOAL_REJECTED_BY_SERVER);
           }
           else
           {
@@ -458,7 +463,7 @@ inline NodeStatus RosActionNode<T>::tick()
     // Check if server is ready
     if(!action_client->action_server_is_ready())
     {
-      return onFailure(SERVER_UNREACHABLE);
+      return onFailure(SERVER_UNREACHABLE, {});
     }
 
     future_goal_handle_ = action_client->async_send_goal(goal, goal_options);
@@ -485,7 +490,7 @@ inline NodeStatus RosActionNode<T>::tick()
       {
         if((now() - time_goal_sent_) > timeout)
         {
-          return CheckStatus(onFailure(SEND_GOAL_TIMEOUT));
+          return CheckStatus(onFailure(SEND_GOAL_TIMEOUT, {}));
         }
         else
         {
@@ -516,11 +521,11 @@ inline NodeStatus RosActionNode<T>::tick()
     {
       if(result_.code == rclcpp_action::ResultCode::ABORTED)
       {
-        return CheckStatus(onFailure(ACTION_ABORTED));
+        return CheckStatus(onFailure(ACTION_ABORTED, result_));
       }
       else if(result_.code == rclcpp_action::ResultCode::CANCELED)
       {
-        return CheckStatus(onFailure(ACTION_CANCELLED));
+        return CheckStatus(onFailure(ACTION_CANCELLED, result_));
       }
       else
       {

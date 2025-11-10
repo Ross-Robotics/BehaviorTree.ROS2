@@ -11,6 +11,8 @@
 // COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+#pragma once
+
 #include <memory>
 #include <optional>
 
@@ -27,6 +29,11 @@ namespace BT
 /**
  * @brief TreeExecutionServer class hosts a ROS Action Server that is able
  * to load Behavior plugins, BehaviorTree.xml files and execute them.
+ *
+ * These are named in the ROS2 node's parameters, see
+ * @link bt_executor_parameters.md @endlink
+ *
+ * A `BT::Groot2Publisher` is included inside (see BehaviorTree.CPP for more information).
  *
  * It can be customized by overriding its virtual functions.
  */
@@ -72,10 +79,19 @@ public:
   /// @brief Pointer to the global blackboard
   BT::Blackboard::Ptr globalBlackboard();
 
-  /// @brief Pointer to the global blackboard
+  /// @brief The behavior tree factory
   BT::BehaviorTreeFactory& factory();
 
 protected:
+  /**
+   * @brief Callback invoked when a goal is received and before the tree is created.
+   * If it returns false, the goal will be rejected.
+  */
+  virtual bool onGoalReceived(const std::string& tree_name, const std::string& payload)
+  {
+    return true;
+  }
+
   /**
    * @brief Callback invoked after the tree is created.
    * It can be used, for instance, to initialize a logger or the global blackboard.

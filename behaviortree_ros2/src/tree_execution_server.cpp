@@ -11,15 +11,24 @@
 // COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4244)
 #include <thread>
+#pragma warning(pop)
+#else
+#include <thread>
+#endif
 
+// auto-generated header, created by generate_parameter_library
+#include "behaviortree_ros2/bt_executor_parameters.hpp"
 #include "behaviortree_ros2/tree_execution_server.hpp"
 #include "behaviortree_ros2/bt_utils.hpp"
 
 #include "behaviortree_cpp/loggers/groot2_publisher.h"
 
-// generated file
-#include <behaviortree_ros2/bt_executor_parameters.hpp>
+#include "btcpp_ros2_interfaces/srv/get_trees.hpp"
+
 namespace
 {
 static const auto kLogger = rclcpp::get_logger("bt_action_server");
@@ -28,6 +37,8 @@ static const auto kLogger = rclcpp::get_logger("bt_action_server");
 namespace BT
 {
 
+using GetTrees = btcpp_ros2_interfaces::srv::GetTrees;
+
 struct TreeExecutionServer::Pimpl
 {
   rclcpp_action::Server<ExecuteTree>::SharedPtr action_server;
@@ -35,6 +46,8 @@ struct TreeExecutionServer::Pimpl
 
   std::shared_ptr<bt_server::ParamListener> param_listener;
   bt_server::Params params;
+
+  rclcpp::Service<GetTrees>::SharedPtr get_trees_service;
 
   BT::BehaviorTreeFactory factory;
   std::shared_ptr<BT::Groot2Publisher> groot_publisher;
@@ -81,6 +94,12 @@ TreeExecutionServer::TreeExecutionServer(const rclcpp::Node::SharedPtr& node)
     p_->single_shot_timer->cancel();
   };
 
+  p_->get_trees_service = node_->create_service<GetTrees>(
+      "get_loaded_trees", [this](const std::shared_ptr<GetTrees::Request> _,
+                                 std::shared_ptr<GetTrees::Response> response) {
+        response->tree_ids = p_->factory.registeredBehaviorTrees();
+      });
+
   p_->single_shot_timer =
       node_->create_wall_timer(std::chrono::milliseconds(1), callback);
 }
@@ -121,6 +140,11 @@ TreeExecutionServer::handle_goal(const rclcpp_action::GoalUUID& /* uuid */,
 {
   RCLCPP_INFO(kLogger, "Received goal request to execute Behavior Tree: %s",
               goal->target_tree.c_str());
+
+  if(!onGoalReceived(goal->target_tree, goal->payload))
+  {
+    return rclcpp_action::GoalResponse::REJECT;
+  }
   return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
 }
 
@@ -230,7 +254,8 @@ void TreeExecutionServer::execute(
       const auto now = std::chrono::steady_clock::now();
       if(now < loop_deadline)
       {
-        p_->tree.sleep(loop_deadline - now);
+        p_->tree.sleep(std::chrono::duration_cast<std::chrono::system_clock::duration>(
+            loop_deadline - now));
       }
       loop_deadline += period;
     }
