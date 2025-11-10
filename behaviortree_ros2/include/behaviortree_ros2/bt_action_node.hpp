@@ -98,19 +98,7 @@ public:
   explicit RosActionNode(const std::string& instance_name, const BT::NodeConfig& conf,
                          const RosNodeParams& params);
 
-  virtual ~RosActionNode()
-  {
-    if (client_instance_) {
-      client_instance_.reset();
-      std::unique_lock lk(getMutex());
-      auto& registry = getRegistry();
-      auto it = registry.find(action_client_key_);
-      if (it != registry.end() && it->second.use_count() <= 1) {
-        registry.erase(it);
-        RCLCPP_INFO(logger(), "Removed action client [%s]", action_name_.c_str());
-      }
-    }
-  }
+  virtual ~RosActionNode() = default;
 
   /**
    * @brief Any subclass of RosActionNode that has ports must implement a
@@ -231,7 +219,7 @@ protected:
   }
 
   using ClientsRegistry =
-      std::unordered_map<std::string, std::shared_ptr<ActionClientInstance>>;
+      std::unordered_map<std::string, std::weak_ptr<ActionClientInstance>>;
   // contains the fully-qualified name of the node and the name of the client
   static ClientsRegistry& getRegistry()
   {
@@ -250,17 +238,13 @@ protected:
 private:
   std::shared_future<typename GoalHandle::SharedPtr> future_goal_handle_;
   typename GoalHandle::SharedPtr goal_handle_;
-  std::mutex goal_handle_mutex_;
+
   rclcpp::Time time_goal_sent_;
   NodeStatus on_feedback_state_change_;
-  std::mutex on_feedback_state_change_mutex_;
   bool goal_received_;
   WrappedResult result_;
-  std::mutex result_mutex_;
 
   bool createClient(const std::string& action_name);
-
-  bool checkActionClient();
 };
 
 //----------------------------------------------------------------
@@ -334,19 +318,26 @@ inline bool RosActionNode<T>::createClient(const std::string& action_name)
 
   auto& registry = getRegistry();
   auto it = registry.find(action_client_key_);
-  if(it == registry.end())
+  if(it == registry.end() || it->second.expired())
   {
     client_instance_ = std::make_shared<ActionClientInstance>(node, action_name);
     registry.insert_or_assign(action_client_key_, client_instance_);
   }
   else
   {
-    client_instance_ = it->second;
+    client_instance_ = it->second.lock();
   }
 
   action_name_ = action_name;
 
-  return true;
+  bool found =
+      client_instance_->action_client->wait_for_action_server(wait_for_server_timeout_);
+  if(!found)
+  {
+    RCLCPP_ERROR(logger(), "%s: Action server with name '%s' is not reachable.",
+                 name().c_str(), action_name_.c_str());
+  }
+  return found;
 }
 
 template <class T>
@@ -420,7 +411,6 @@ inline NodeStatus RosActionNode<T>::tick()
     goal_options.feedback_callback =
         [this](typename GoalHandle::SharedPtr,
                const std::shared_ptr<const Feedback> feedback) {
-          std::lock_guard<std::mutex> lock(on_feedback_state_change_mutex_);
           on_feedback_state_change_ = onFeedback(feedback);
           if(on_feedback_state_change_ == NodeStatus::IDLE)
           {
@@ -430,15 +420,8 @@ inline NodeStatus RosActionNode<T>::tick()
         };
     //--------------------
     goal_options.result_callback = [this](const WrappedResult& result) {
-      std::lock_guard<std::mutex> lock(goal_handle_mutex_);
-      if (!goal_handle_) {
-        RCLCPP_WARN(logger(), "Received result but goal handle is invalid.");
-        return;
-      }
-
       if(goal_handle_->get_goal_id() == result.goal_id)
       {
-        std::lock_guard<std::mutex> lock(result_mutex_);
         RCLCPP_DEBUG(logger(), "result_callback");
         result_ = result;
         emitWakeUpSignal();
@@ -447,7 +430,6 @@ inline NodeStatus RosActionNode<T>::tick()
     //--------------------
     goal_options.goal_response_callback =
         [this](typename GoalHandle::SharedPtr const future_handle) {
-          std::lock_guard<std::mutex> lock(goal_handle_mutex_);
           auto goal_handle_ = future_handle.get();
           if(!goal_handle_)
           {
@@ -593,19 +575,6 @@ inline void RosActionNode<T>::cancelGoal()
     RCLCPP_ERROR(logger(), "Failed to get result call failed :( for [%s]",
                  action_name_.c_str());
   }
-}
-
-template <class T>
-inline bool RosActionNode<T>::checkActionClient()
-{
-  bool found =
-    client_instance_->action_client->wait_for_action_server(wait_for_server_timeout_);
-  if (!found) {
-    RCLCPP_ERROR(
-      logger(), "%s: Action server with name '%s' is not reachable.", name().c_str(),
-      action_name_.c_str());
-  }
-  return found;
 }
 
 }  // namespace BT
