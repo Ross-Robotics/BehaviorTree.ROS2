@@ -167,7 +167,7 @@ public:
   /** Callback invoked when something goes wrong.
    * It must return either SUCCESS or FAILURE.
    */
-  virtual BT::NodeStatus onFailure(ActionNodeErrorCode /*error*/)
+  virtual BT::NodeStatus onFailure(ActionNodeErrorCode /*error*/, const WrappedResult& /*result*/ = {})
   {
     return NodeStatus::FAILURE;
   }
@@ -233,6 +233,7 @@ protected:
   const std::chrono::milliseconds wait_for_server_timeout_;
   std::string action_client_key_;
 
+
 private:
   std::shared_future<typename GoalHandle::SharedPtr> future_goal_handle_;
   typename GoalHandle::SharedPtr goal_handle_;
@@ -241,9 +242,8 @@ private:
   NodeStatus on_feedback_state_change_;
   std::mutex on_feedback_state_change_mutex_;
   bool goal_received_;
-  WrappedResult result_;
   std::mutex result_mutex_;
-
+  WrappedResult result_;
   bool createClient(const std::string& action_name);
 
   bool checkActionClient();
