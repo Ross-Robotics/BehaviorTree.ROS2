@@ -125,7 +125,12 @@ public:
    */
   static PortsList providedBasicPorts(PortsList addition)
   {
-    PortsList basic = { InputPort<std::string>("action_name", "", "Action server name") };
+    PortsList basic = { InputPort<std::string>("action_name", "", "Action server name"),
+                        InputPort<int>("server_timeout", 1000,
+                                        "Action server goal timeout (msecs)"),
+                      InputPort<int>("wait_for_server_timeout", 500,
+                                        "Action server discovery timeout (msecs)")
+    };
     basic.insert(addition.begin(), addition.end());
     return basic;
   }
@@ -243,8 +248,8 @@ protected:
   std::shared_ptr<ActionClientInstance> client_instance_;
   std::string action_name_;
   bool action_name_should_be_checked_ = false;
-  const std::chrono::milliseconds server_timeout_;
-  const std::chrono::milliseconds wait_for_server_timeout_;
+  std::chrono::milliseconds server_timeout_;
+  std::chrono::milliseconds wait_for_server_timeout_;
   std::string action_client_key_;
 
 private:
@@ -291,8 +296,45 @@ inline RosActionNode<T>::RosActionNode(const std::string& instance_name,
   // - we use the action_name in the port and it is a static string.
   // - we use the action_name in the port and it is blackboard entry.
 
+  // update server_timeout_ if set throuh port and greater than 0
+  auto portIt = config().input_ports.find("server_timeout");
+  if(portIt != config().input_ports.end())
+  {
+    int timeout = 0;
+    getInput("server_timeout", timeout);
+    if(timeout > 0)
+    {
+      server_timeout_ = std::chrono::milliseconds(timeout);
+    }
+    else
+    {
+      RCLCPP_WARN(logger(),
+                  "%s: Port `server_timeout` is not greater than zero. "
+                  "Defaulting to %d mSec.",
+                  name().c_str(), static_cast<int>(server_timeout_.count()));
+    }
+  }
+  // update wait_for_server_timeout_ if set throuh port and greater than 0
+  portIt = config().input_ports.find("wait_for_server_timeout");
+  if(portIt != config().input_ports.end())
+  {
+    int timeout = 0;
+    getInput("wait_for_server_timeout", timeout);
+    if(timeout > 0)
+    {
+      wait_for_server_timeout_ = std::chrono::milliseconds(timeout);
+    }
+    else
+    {
+      RCLCPP_WARN(logger(),
+                  "%s: Port `wait_for_server_timeout` is not greater than zero. "
+                  "Defaulting to %d mSec.",
+                  name().c_str(), static_cast<int>(wait_for_server_timeout_.count()));
+    }
+  }
+
   // check port remapping
-  auto portIt = config().input_ports.find("action_name");
+  portIt = config().input_ports.find("action_name");
   if(portIt != config().input_ports.end())
   {
     const std::string& bb_service_name = portIt->second;
