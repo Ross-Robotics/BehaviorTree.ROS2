@@ -522,6 +522,8 @@ inline NodeStatus RosActionNode<T>::tick()
     // FIRST case: check if the goal request has a timeout
     if(!goal_received_)
     {
+      client_instance_->callback_executor.spin_some();
+
       auto nodelay = std::chrono::milliseconds(0);
       auto timeout =
           rclcpp::Duration::from_seconds(double(server_timeout_.count()) / 1000);
