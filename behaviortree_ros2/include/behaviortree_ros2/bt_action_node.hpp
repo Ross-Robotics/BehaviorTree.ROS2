@@ -20,6 +20,7 @@
 #include <optional>
 #include <rclcpp/executors.hpp>
 #include <rclcpp/allocator/allocator_common.hpp>
+#include <rclcpp_action/exceptions.hpp>
 #include "behaviortree_cpp/action_node.h"
 #include "behaviortree_cpp/bt_factory.h"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -478,13 +479,23 @@ inline NodeStatus RosActionNode<T>::tick()
         return;
       }
 
-      if(goal_handle_->get_goal_id() == result.goal_id)
-      {
-        std::lock_guard<std::mutex> lock(result_mutex_);
-        RCLCPP_DEBUG(logger(), "result_callback");
+      try {
+        if(goal_handle_->get_goal_id() != result.goal_id)
+        {
+          return;
+        }
+      } catch (const rclcpp_action::exceptions::UnknownGoalHandleError& error) {
+        goal_handle_.reset();
+        future_goal_handle_ = {};
+        std::lock_guard<std::mutex> result_lock(result_mutex_);
         result_ = result;
         emitWakeUpSignal();
+        return;
       }
+
+      std::lock_guard<std::mutex> result_lock(result_mutex_);
+      result_ = result;
+      emitWakeUpSignal();
     };
     //--------------------
     goal_options.goal_response_callback =
@@ -620,9 +631,16 @@ inline void RosActionNode<T>::cancelGoal()
   }
 
   auto& action_client = client_instance_->action_client;
-
-  auto future_result = action_client->async_get_result(goal_handle_);
-  auto future_cancel = action_client->async_cancel_goal(goal_handle_);
+  decltype(action_client->async_get_result(goal_handle_)) future_result;
+  decltype(action_client->async_cancel_goal(goal_handle_)) future_cancel;
+  try {
+    future_result = action_client->async_get_result(goal_handle_);
+    future_cancel = action_client->async_cancel_goal(goal_handle_);
+  } catch (const rclcpp_action::exceptions::UnknownGoalHandleError& error) {
+    goal_handle_.reset();
+    future_goal_handle_ = {};
+    return;
+  }
 
   constexpr auto SUCCESS = rclcpp::FutureReturnCode::SUCCESS;
 
@@ -637,6 +655,8 @@ inline void RosActionNode<T>::cancelGoal()
     RCLCPP_ERROR(logger(), "Failed to get result call failed :( for [%s]",
                  action_name_.c_str());
   }
+
+
 }
 
 template <class T>
