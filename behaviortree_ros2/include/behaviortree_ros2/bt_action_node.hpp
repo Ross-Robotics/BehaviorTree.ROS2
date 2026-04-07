@@ -425,8 +425,7 @@ inline NodeStatus RosActionNode<T>::tick()
         };
     //--------------------
     goal_options.result_callback = [this](const WrappedResult& result) {
-    try
-    {
+    try {
       bool matches_active_goal = false;
 
       {
@@ -451,8 +450,7 @@ inline NodeStatus RosActionNode<T>::tick()
         matches_active_goal = true;
       }
 
-      if (matches_active_goal)
-      {
+      if (matches_active_goal) {
         {
           std::lock_guard<std::mutex> result_lock(result_mutex_);
           result_ = result;
@@ -463,23 +461,16 @@ inline NodeStatus RosActionNode<T>::tick()
           goal_handle_.reset();
         }
 
-        future_goal_handle_ = {};
-        goal_received_ = false;
-
         RCLCPP_DEBUG(logger(), "Stored terminal result for [%s]", action_name_.c_str());
         emitWakeUpSignal();
       }
-    }
-    catch (const std::exception& e)
-    {
+    } catch (const std::exception& e) {
       RCLCPP_ERROR(
         logger(),
         "Exception in result_callback for [%s]: %s",
         action_name_.c_str(),
         e.what());
-    }
-    catch (...)
-    {
+    } catch (...) {
       RCLCPP_ERROR(
         logger(),
         "Unknown exception in result_callback for [%s]",
@@ -507,6 +498,14 @@ inline NodeStatus RosActionNode<T>::tick()
     // FIRST case: check if the goal request has a timeout
     if(!goal_received_)
     {
+      if(!future_goal_handle_.valid()) {
+        RCLCPP_WARN(
+          logger(),
+          "[%s] goal_received_ is false but future_goal_handle_ has no state",
+          action_name_.c_str());
+        return CheckStatus(onFailure(SEND_GOAL_TIMEOUT));
+      }
+
       auto nodelay = std::chrono::milliseconds(0);
       auto timeout =
           rclcpp::Duration::from_seconds(double(server_timeout_.count()) / 1000);
