@@ -425,20 +425,58 @@ inline NodeStatus RosActionNode<T>::tick()
         };
     //--------------------
     goal_options.result_callback = [this](const WrappedResult& result) {
-      std::lock_guard<std::mutex> lock(goal_handle_mutex_);
-      if (!goal_handle_) {
-        RCLCPP_WARN(logger(), "Received result but goal handle is invalid.");
-        return;
+    try {
+      bool matches_active_goal = false;
+
+      {
+        std::lock_guard<std::mutex> goal_lock(goal_handle_mutex_);
+
+        if (!goal_handle_) {
+          RCLCPP_WARN(
+            logger(),
+            "Received result for [%s] but goal_handle_ is already empty. Ignoring.",
+            action_name_.c_str());
+          return;
+        }
+
+        if (goal_handle_->get_goal_id() != result.goal_id) {
+          RCLCPP_WARN(
+            logger(),
+            "Received result for [%s] but goal_id does not match active goal. Ignoring.",
+            action_name_.c_str());
+          return;
+        }
+
+        matches_active_goal = true;
       }
 
-      if(goal_handle_->get_goal_id() == result.goal_id)
-      {
-        std::lock_guard<std::mutex> lock(result_mutex_);
-        RCLCPP_DEBUG(logger(), "result_callback");
-        result_ = result;
+      if (matches_active_goal) {
+        {
+          std::lock_guard<std::mutex> result_lock(result_mutex_);
+          result_ = result;
+        }
+
+        {
+          std::lock_guard<std::mutex> goal_lock(goal_handle_mutex_);
+          goal_handle_.reset();
+        }
+
+        RCLCPP_DEBUG(logger(), "Stored terminal result for [%s]", action_name_.c_str());
         emitWakeUpSignal();
       }
-    };
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(
+        logger(),
+        "Exception in result_callback for [%s]: %s",
+        action_name_.c_str(),
+        e.what());
+    } catch (...) {
+      RCLCPP_ERROR(
+        logger(),
+        "Unknown exception in result_callback for [%s]",
+        action_name_.c_str());
+    }
+  };
     //--------------------
     // Check if server is ready
     if(!action_client->action_server_is_ready())
@@ -460,6 +498,14 @@ inline NodeStatus RosActionNode<T>::tick()
     // FIRST case: check if the goal request has a timeout
     if(!goal_received_)
     {
+      if(!future_goal_handle_.valid()) {
+        RCLCPP_WARN(
+          logger(),
+          "[%s] goal_received_ is false but future_goal_handle_ has no state",
+          action_name_.c_str());
+        return CheckStatus(onFailure(SEND_GOAL_TIMEOUT));
+      }
+
       auto nodelay = std::chrono::milliseconds(0);
       auto timeout =
           rclcpp::Duration::from_seconds(double(server_timeout_.count()) / 1000);
@@ -529,50 +575,181 @@ inline void RosActionNode<T>::halt()
 template <class T>
 inline void RosActionNode<T>::cancelGoal()
 {
-  auto& executor = client_instance_->callback_executor;
-  if(!goal_handle_)
+  if (!client_instance_)
   {
-    if(future_goal_handle_.valid())
+    RCLCPP_WARN(logger(), "cancelGoal called for [%s] with no client instance", action_name_.c_str());
+    return;
+  }
+
+  auto& executor = client_instance_->callback_executor;
+  auto& action_client = client_instance_->action_client;
+
+  // If we already have a terminal result, there is nothing left to cancel.
+  {
+    std::lock_guard<std::mutex> result_lock(result_mutex_);
+    if (result_.code != rclcpp_action::ResultCode::UNKNOWN)
     {
-      // Here the discussion is if we should block or put a timer for the waiting
-      auto ret =
-          executor.spin_until_future_complete(future_goal_handle_, server_timeout_);
-      if(ret != rclcpp::FutureReturnCode::SUCCESS)
-      {
-        // In that case the goal was not accepted or timed out so probably we should do nothing.
-        return;
-      }
-      else
-      {
-        goal_handle_ = future_goal_handle_.get();
-        future_goal_handle_ = {};
-      }
-    }
-    else
-    {
-      RCLCPP_WARN(logger(), "cancelGoal called on an empty goal_handle");
+      RCLCPP_DEBUG(
+        logger(),
+        "cancelGoal skipped for [%s]: terminal result already received",
+        action_name_.c_str());
+
+      std::lock_guard<std::mutex> goal_lock(goal_handle_mutex_);
+      goal_handle_.reset();
+      future_goal_handle_ = {};
+      goal_received_ = false;
       return;
     }
   }
 
-  auto& action_client = client_instance_->action_client;
+  typename GoalHandle::SharedPtr local_goal_handle;
 
-  auto future_result = action_client->async_get_result(goal_handle_);
-  auto future_cancel = action_client->async_cancel_goal(goal_handle_);
-
-  constexpr auto SUCCESS = rclcpp::FutureReturnCode::SUCCESS;
-
-  if(executor.spin_until_future_complete(future_cancel, server_timeout_) != SUCCESS)
   {
-    RCLCPP_ERROR(logger(), "Failed to cancel action server for [%s]",
-                 action_name_.c_str());
+    std::lock_guard<std::mutex> goal_lock(goal_handle_mutex_);
+    local_goal_handle = goal_handle_;
   }
 
-  if(executor.spin_until_future_complete(future_result, server_timeout_) != SUCCESS)
+  // If the goal has been sent but not yet accepted/rejected, try to resolve that future first.
+  if (!local_goal_handle)
   {
-    RCLCPP_ERROR(logger(), "Failed to get result call failed :( for [%s]",
-                 action_name_.c_str());
+    if (future_goal_handle_.valid())
+    {
+      auto ret = executor.spin_until_future_complete(future_goal_handle_, server_timeout_);
+
+      if (ret == rclcpp::FutureReturnCode::SUCCESS)
+      {
+        local_goal_handle = future_goal_handle_.get();
+        future_goal_handle_ = {};
+
+        if (local_goal_handle)
+        {
+          std::lock_guard<std::mutex> goal_lock(goal_handle_mutex_);
+          goal_handle_ = local_goal_handle;
+          goal_received_ = true;
+        }
+        else
+        {
+          // Goal rejected. Nothing to cancel.
+          RCLCPP_DEBUG(
+            logger(),
+            "cancelGoal for [%s]: goal was rejected or null handle returned",
+            action_name_.c_str());
+
+          future_goal_handle_ = {};
+          goal_received_ = false;
+          return;
+        }
+      }
+      else
+      {
+        // Goal acceptance is still unresolved or timed out. Don't crash trying to cancel.
+        RCLCPP_WARN(
+          logger(),
+          "cancelGoal for [%s]: goal handle not ready in time, skipping cancel",
+          action_name_.c_str());
+
+        future_goal_handle_ = {};
+        goal_received_ = false;
+        return;
+      }
+    }
+    else
+    {
+      RCLCPP_DEBUG(
+        logger(),
+        "cancelGoal for [%s]: no active goal_handle_ and no pending future",
+        action_name_.c_str());
+      return;
+    }
   }
+
+  // Try cancel first. This is the meaningful halt operation.
+  try
+  {
+    auto future_cancel = action_client->async_cancel_goal(local_goal_handle);
+
+    if (executor.spin_until_future_complete(future_cancel, server_timeout_) !=
+        rclcpp::FutureReturnCode::SUCCESS)
+    {
+      RCLCPP_WARN(
+        logger(),
+        "cancelGoal for [%s]: cancel request did not complete in time",
+        action_name_.c_str());
+    }
+    else
+    {
+      RCLCPP_DEBUG(logger(), "cancelGoal for [%s]: cancel request completed", action_name_.c_str());
+    }
+  }
+  catch (const std::exception& e)
+  {
+    RCLCPP_WARN(
+      logger(),
+      "cancelGoal for [%s]: async_cancel_goal threw: %s",
+      action_name_.c_str(),
+      e.what());
+  }
+  catch (...)
+  {
+    RCLCPP_WARN(
+      logger(),
+      "cancelGoal for [%s]: async_cancel_goal threw unknown exception",
+      action_name_.c_str());
+  }
+
+  // Optionally wait for the terminal result after cancel, but never crash if the
+  // action client no longer recognizes the goal handle.
+  try
+  {
+    auto future_result = action_client->async_get_result(local_goal_handle);
+
+    if (executor.spin_until_future_complete(future_result, server_timeout_) ==
+        rclcpp::FutureReturnCode::SUCCESS)
+    {
+      auto wrapped_result = future_result.get();
+
+      {
+        std::lock_guard<std::mutex> result_lock(result_mutex_);
+        result_ = wrapped_result;
+      }
+
+      RCLCPP_DEBUG(
+        logger(),
+        "cancelGoal for [%s]: terminal result received after cancel",
+        action_name_.c_str());
+    }
+    else
+    {
+      RCLCPP_WARN(
+        logger(),
+        "cancelGoal for [%s]: timed out waiting for result after cancel",
+        action_name_.c_str());
+    }
+  }
+  catch (const std::exception& e)
+  {
+    RCLCPP_WARN(
+      logger(),
+      "cancelGoal for [%s]: async_get_result threw: %s",
+      action_name_.c_str(),
+      e.what());
+  }
+  catch (...)
+  {
+    RCLCPP_WARN(
+      logger(),
+      "cancelGoal for [%s]: async_get_result threw unknown exception",
+      action_name_.c_str());
+  }
+
+  // Clear local goal state no matter what. The node is being halted.
+  {
+    std::lock_guard<std::mutex> goal_lock(goal_handle_mutex_);
+    goal_handle_.reset();
+  }
+
+  future_goal_handle_ = {};
+  goal_received_ = false;
 }
 
 template <class T>
