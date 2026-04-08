@@ -15,6 +15,7 @@
 #pragma once
 
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/executors/single_threaded_executor.hpp>
 #include <string>
 #include <chrono>
 #include <memory>
@@ -40,6 +41,13 @@ struct RosNodeParams
   std::chrono::milliseconds server_timeout = std::chrono::milliseconds(1000);
   // timeout used when detecting the server the first time
   std::chrono::milliseconds wait_for_server_timeout = std::chrono::milliseconds(500);
+
+  // Optional shared executor for subscriber callback groups.
+  // When set, all RosTopicSubNode instances add their callback groups to this
+  // executor instead of creating a per-topic SingleThreadedExecutor.
+  // The caller is responsible for calling spin_some() on it before each tree tick.
+  // When null (default), per-instance executors are used — backward-compatible behaviour.
+  std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> shared_executor;
 };
 
 }  // namespace BT

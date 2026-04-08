@@ -51,13 +51,22 @@ public:
 protected:
   struct SubscriberInstance
   {
-    SubscriberInstance(std::shared_ptr<rclcpp::Node> node, const std::string& topic_name);
+    // When shared_exec is non-null the callback group is registered on that executor
+    // instead of callback_group_executor, and ~SubscriberInstance() removes it cleanly.
+    SubscriberInstance(
+      std::shared_ptr<rclcpp::Node> node,
+      const std::string& topic_name,
+      std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> shared_exec = nullptr);
+
+    ~SubscriberInstance();
 
     std::shared_ptr<Subscriber> subscriber;
     rclcpp::CallbackGroup::SharedPtr callback_group;
     rclcpp::executors::SingleThreadedExecutor callback_group_executor;
     boost::signals2::signal<void(const std::shared_ptr<TopicT>)> broadcaster;
     std::shared_ptr<TopicT> last_msg;
+    // Non-null only when using a shared executor (owned by the tree executor).
+    std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> shared_executor;
   };
 
   static std::mutex& registryMutex()
@@ -82,6 +91,8 @@ protected:
   std::string topic_name_;
   boost::signals2::connection signal_connection_;
   std::string subscriber_key_;
+  // Mirrors RosNodeParams::shared_executor; null when using per-instance executors.
+  std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> shared_executor_;
 
   rclcpp::Logger logger()
   {
@@ -175,14 +186,40 @@ private:
 //---------------------- DEFINITIONS -----------------------------
 //----------------------------------------------------------------
 template <class T>
+inline RosTopicSubNode<T>::SubscriberInstance::~SubscriberInstance()
+{
+  // If a shared executor owns this callback group, remove it explicitly so
+  // the executor's wait set stays clean after tree teardown.
+  if(shared_executor && callback_group)
+  {
+    try
+    {
+      shared_executor->remove_callback_group(callback_group);
+    }
+    catch(const std::exception&) {}
+  }
+}
+
+template <class T>
 inline RosTopicSubNode<T>::SubscriberInstance::SubscriberInstance(
-    std::shared_ptr<rclcpp::Node> node, const std::string& topic_name)
+    std::shared_ptr<rclcpp::Node> node,
+    const std::string& topic_name,
+    std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> shared_exec)
+  : shared_executor(shared_exec)
 {
   // create a callback group for this particular instance
   callback_group =
       node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
-  callback_group_executor.add_callback_group(callback_group,
-                                             node->get_node_base_interface());
+
+  if(shared_executor)
+  {
+    shared_executor->add_callback_group(callback_group, node->get_node_base_interface());
+  }
+  else
+  {
+    callback_group_executor.add_callback_group(callback_group,
+                                               node->get_node_base_interface());
+  }
 
   rclcpp::SubscriptionOptions option;
   option.callback_group = callback_group;
@@ -202,7 +239,9 @@ template <class T>
 inline RosTopicSubNode<T>::RosTopicSubNode(const std::string& instance_name,
                                            const NodeConfig& conf,
                                            const RosNodeParams& params)
-  : BT::ConditionNode(instance_name, conf), node_(params.nh)
+  : BT::ConditionNode(instance_name, conf)
+  , node_(params.nh)
+  , shared_executor_(params.shared_executor)
 {
   // check port remapping
   auto portIt = config().input_ports.find("topic_name");
@@ -276,7 +315,7 @@ inline bool RosTopicSubNode<T>::createSubscriber(const std::string& topic_name)
   auto it = registry.find(subscriber_key_);
   if(it == registry.end())
   {
-    sub_instance_ = std::make_shared<SubscriberInstance>(node, topic_name);
+    sub_instance_ = std::make_shared<SubscriberInstance>(node, topic_name, shared_executor_);
     registry.insert({ subscriber_key_, sub_instance_ });
 
     RCLCPP_INFO(logger(), "Node [%s] created Subscriber to topic [%s]", name().c_str(),
@@ -329,7 +368,13 @@ inline NodeStatus RosTopicSubNode<T>::tick()
     }
     return status;
   };
-  sub_instance_->callback_group_executor.spin_some();
+  // When a shared executor is in use the execute() loop calls spin_some() on it
+  // once before tickOnce(), draining all subscriber callbacks in a single pass.
+  // Per-instance spin_some() is only needed in the legacy path.
+  if(!shared_executor_)
+  {
+    sub_instance_->callback_group_executor.spin_some();
+  }
   auto status = CheckStatus(onTick(last_msg_));
   if(!latchLastMessage())
   {
