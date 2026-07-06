@@ -236,13 +236,17 @@ protected:
 private:
   std::shared_future<typename GoalHandle::SharedPtr> future_goal_handle_;
   typename GoalHandle::SharedPtr goal_handle_;
-  std::mutex goal_handle_mutex_;
   rclcpp::Time time_goal_sent_;
   NodeStatus on_feedback_state_change_;
   std::mutex on_feedback_state_change_mutex_;
   bool goal_received_;
   WrappedResult result_;
-  std::mutex result_mutex_;
+  WrappedResult pending_result_;   // holds a result that arrived before goal_handle_ was set
+  bool has_pending_result_ = false;
+  // Single mutex protecting goal_handle_, goal_received_, result_, pending_result_, and
+  // has_pending_result_ together. They form one state machine, so one lock avoids
+  // ordering issues and ensures consistent snapshots when reading in tick().
+  std::mutex action_state_mutex_;
 
   bool createClient(const std::string& action_name);
 
@@ -397,10 +401,19 @@ inline NodeStatus RosActionNode<T>::tick()
   {
     setStatus(NodeStatus::RUNNING);
 
-    goal_received_ = false;
+    {
+      std::lock_guard<std::mutex> state_lock(action_state_mutex_);
+      goal_handle_.reset();
+      goal_received_ = false;
+      result_ = {};
+      pending_result_ = {};
+      has_pending_result_ = false;
+    }
     future_goal_handle_ = {};
-    on_feedback_state_change_ = NodeStatus::RUNNING;
-    result_ = {};
+    {
+      std::lock_guard<std::mutex> feedback_lock(on_feedback_state_change_mutex_);
+      on_feedback_state_change_ = NodeStatus::RUNNING;
+    }
 
     Goal goal;
 
@@ -424,44 +437,85 @@ inline NodeStatus RosActionNode<T>::tick()
           emitWakeUpSignal();
         };
     //--------------------
+    // goal_response_callback normally provides the accepted goal handle before the
+    // terminal result is processed. If a result is observed before goal_handle_ is
+    // available, result_callback stores it as pending and this callback validates it
+    // against the accepted goal_id.
+    goal_options.goal_response_callback =
+        [this](typename GoalHandle::SharedPtr handle) {
+          if (handle) {
+            std::lock_guard<std::mutex> state_lock(action_state_mutex_);
+            goal_handle_ = handle;
+            goal_received_ = true;
+
+            // If a result arrived before this callback (fast server abort race), validate
+            // it now that we have the goal handle and can check the goal ID.
+            if (has_pending_result_) {
+              if (pending_result_.goal_id == handle->get_goal_id()) {
+                result_ = pending_result_;
+                goal_handle_.reset();
+              } else {
+                RCLCPP_WARN(
+                  logger(),
+                  "Discarding pending early result for [%s]: goal_id does not match "
+                  "accepted goal.",
+                  action_name_.c_str());
+              }
+              pending_result_ = {};
+              has_pending_result_ = false;
+            }
+          }
+          // If null the goal was rejected; GOAL_REJECTED_BY_SERVER is handled in tick().
+          emitWakeUpSignal();
+        };
+    //--------------------
     goal_options.result_callback = [this](const WrappedResult& result) {
     try {
-      bool matches_active_goal = false;
+      bool should_wake = false;
 
       {
-        std::lock_guard<std::mutex> goal_lock(goal_handle_mutex_);
+        std::lock_guard<std::mutex> state_lock(action_state_mutex_);
 
         if (!goal_handle_) {
-          RCLCPP_WARN(
-            logger(),
-            "Received result for [%s] but goal_handle_ is already empty. Ignoring.",
-            action_name_.c_str());
-          return;
-        }
-
-        if (goal_handle_->get_goal_id() != result.goal_id) {
+          // goal_handle_ is null. Two possible causes:
+          // (a) The result arrived before goal_response_callback populated goal_handle_
+          //     (fast server abort). Store it; goal_response_callback or tick()'s FIRST
+          //     case will validate it against the accepted goal_id before promoting it.
+          // (b) Stale result from a previous goal whose handle was already cleared.
+          //     The goal_id check in goal_response_callback will discard it if stale.
+          // Either way, never ignore — (a) would cause the node to get stuck.
+          if (!has_pending_result_) {
+            RCLCPP_WARN(
+              logger(),
+              "Received result for [%s] while goal_handle_ is empty. Storing as pending "
+              "for goal_id validation.",
+              action_name_.c_str());
+            pending_result_ = result;
+            has_pending_result_ = true;
+            should_wake = true;
+          } else {
+            RCLCPP_WARN(
+              logger(),
+              "Received result for [%s] but a pending result already exists. Ignoring.",
+              action_name_.c_str());
+          }
+        } else if (goal_handle_->get_goal_id() != result.goal_id) {
           RCLCPP_WARN(
             logger(),
             "Received result for [%s] but goal_id does not match active goal. Ignoring.",
             action_name_.c_str());
-          return;
+        } else {
+          // Store result and clear the handle atomically under the same lock so that
+          // no other reader can see a partial state (result set but handle not yet
+          // cleared or vice versa).
+          result_ = result;
+          goal_handle_.reset();
+          should_wake = true;
         }
-
-        matches_active_goal = true;
       }
 
-      if (matches_active_goal) {
-        {
-          std::lock_guard<std::mutex> result_lock(result_mutex_);
-          result_ = result;
-        }
-
-        {
-          std::lock_guard<std::mutex> goal_lock(goal_handle_mutex_);
-          goal_handle_.reset();
-        }
-
-        RCLCPP_DEBUG(logger(), "Stored terminal result for [%s]", action_name_.c_str());
+      if (should_wake) {
+        RCLCPP_DEBUG(logger(), "Stored terminal/pending result for [%s]", action_name_.c_str());
         emitWakeUpSignal();
       }
     } catch (const std::exception& e) {
@@ -495,8 +549,15 @@ inline NodeStatus RosActionNode<T>::tick()
     std::unique_lock<std::mutex> lock(getMutex());
     client_instance_->callback_executor.spin_some();
 
-    // FIRST case: check if the goal request has a timeout
-    if(!goal_received_)
+    // FIRST case: check if the goal request has a timeout.
+    // Take a snapshot under the lock so we don't race with goal_response_callback.
+    bool goal_received_snapshot;
+    {
+      std::lock_guard<std::mutex> state_lock(action_state_mutex_);
+      goal_received_snapshot = goal_received_;
+    }
+
+    if(!goal_received_snapshot)
     {
       if(!future_goal_handle_.valid()) {
         RCLCPP_WARN(
@@ -525,37 +586,74 @@ inline NodeStatus RosActionNode<T>::tick()
       }
       else
       {
-        goal_received_ = true;
-        goal_handle_ = future_goal_handle_.get();
+        auto handle = future_goal_handle_.get();
         future_goal_handle_ = {};
 
-        if(!goal_handle_)
+        {
+          std::lock_guard<std::mutex> state_lock(action_state_mutex_);
+          // goal_response_callback may have already set these; only write if it hasn't.
+          if (!goal_received_) {
+            goal_handle_ = handle;
+            goal_received_ = true;
+          }
+          // Belt-and-suspenders: promote any pending result that arrived before
+          // goal_response_callback fired and that callback didn't already handle.
+          if (has_pending_result_ && goal_handle_) {
+            if (pending_result_.goal_id == goal_handle_->get_goal_id()) {
+              result_ = pending_result_;
+              goal_handle_.reset();
+            } else {
+              RCLCPP_WARN(
+                logger(),
+                "Discarding pending early result for [%s]: goal_id does not match "
+                "accepted goal.",
+                action_name_.c_str());
+            }
+            pending_result_ = {};
+            has_pending_result_ = false;
+          }
+        }
+
+        if(!handle)
         {
           return CheckStatus(onFailure(GOAL_REJECTED_BY_SERVER));
         }
       }
     }
 
-    // SECOND case: onFeedback requested a stop
-    if(on_feedback_state_change_ != NodeStatus::RUNNING)
+    // SECOND case: onFeedback requested a stop.
+    // Snapshot under its mutex to avoid racing with feedback_callback.
+    NodeStatus feedback_state;
+    {
+      std::lock_guard<std::mutex> feedback_lock(on_feedback_state_change_mutex_);
+      feedback_state = on_feedback_state_change_;
+    }
+    if(feedback_state != NodeStatus::RUNNING)
     {
       cancelGoal();
-      return on_feedback_state_change_;
+      return feedback_state;
     }
-    // THIRD case: result received, requested a stop
-    if(result_.code != rclcpp_action::ResultCode::UNKNOWN)
+    // THIRD case: result received.
+    // Snapshot under lock so we don't race with result_callback.
+    WrappedResult result_snapshot;
     {
-      if(result_.code == rclcpp_action::ResultCode::ABORTED)
+      std::lock_guard<std::mutex> state_lock(action_state_mutex_);
+      result_snapshot = result_;
+    }
+
+    if(result_snapshot.code != rclcpp_action::ResultCode::UNKNOWN)
+    {
+      if(result_snapshot.code == rclcpp_action::ResultCode::ABORTED)
       {
         return CheckStatus(onFailure(ACTION_ABORTED));
       }
-      else if(result_.code == rclcpp_action::ResultCode::CANCELED)
+      else if(result_snapshot.code == rclcpp_action::ResultCode::CANCELED)
       {
         return CheckStatus(onFailure(ACTION_CANCELLED));
       }
       else
       {
-        return CheckStatus(onResultReceived(result_));
+        return CheckStatus(onResultReceived(result_snapshot));
       }
     }
   }
@@ -586,7 +684,7 @@ inline void RosActionNode<T>::cancelGoal()
 
   // If we already have a terminal result, there is nothing left to cancel.
   {
-    std::lock_guard<std::mutex> result_lock(result_mutex_);
+    std::lock_guard<std::mutex> state_lock(action_state_mutex_);
     if (result_.code != rclcpp_action::ResultCode::UNKNOWN)
     {
       RCLCPP_DEBUG(
@@ -594,10 +692,11 @@ inline void RosActionNode<T>::cancelGoal()
         "cancelGoal skipped for [%s]: terminal result already received",
         action_name_.c_str());
 
-      std::lock_guard<std::mutex> goal_lock(goal_handle_mutex_);
       goal_handle_.reset();
       future_goal_handle_ = {};
       goal_received_ = false;
+      pending_result_ = {};
+      has_pending_result_ = false;
       return;
     }
   }
@@ -605,7 +704,7 @@ inline void RosActionNode<T>::cancelGoal()
   typename GoalHandle::SharedPtr local_goal_handle;
 
   {
-    std::lock_guard<std::mutex> goal_lock(goal_handle_mutex_);
+    std::lock_guard<std::mutex> state_lock(action_state_mutex_);
     local_goal_handle = goal_handle_;
   }
 
@@ -623,7 +722,7 @@ inline void RosActionNode<T>::cancelGoal()
 
         if (local_goal_handle)
         {
-          std::lock_guard<std::mutex> goal_lock(goal_handle_mutex_);
+          std::lock_guard<std::mutex> state_lock(action_state_mutex_);
           goal_handle_ = local_goal_handle;
           goal_received_ = true;
         }
@@ -636,7 +735,12 @@ inline void RosActionNode<T>::cancelGoal()
             action_name_.c_str());
 
           future_goal_handle_ = {};
-          goal_received_ = false;
+          {
+            std::lock_guard<std::mutex> state_lock(action_state_mutex_);
+            goal_received_ = false;
+            pending_result_ = {};
+            has_pending_result_ = false;
+          }
           return;
         }
       }
@@ -649,7 +753,12 @@ inline void RosActionNode<T>::cancelGoal()
           action_name_.c_str());
 
         future_goal_handle_ = {};
-        goal_received_ = false;
+        {
+          std::lock_guard<std::mutex> state_lock(action_state_mutex_);
+          goal_received_ = false;
+          pending_result_ = {};
+          has_pending_result_ = false;
+        }
         return;
       }
     }
@@ -709,7 +818,7 @@ inline void RosActionNode<T>::cancelGoal()
       auto wrapped_result = future_result.get();
 
       {
-        std::lock_guard<std::mutex> result_lock(result_mutex_);
+        std::lock_guard<std::mutex> state_lock(action_state_mutex_);
         result_ = wrapped_result;
       }
 
@@ -744,12 +853,14 @@ inline void RosActionNode<T>::cancelGoal()
 
   // Clear local goal state no matter what. The node is being halted.
   {
-    std::lock_guard<std::mutex> goal_lock(goal_handle_mutex_);
+    std::lock_guard<std::mutex> state_lock(action_state_mutex_);
     goal_handle_.reset();
+    goal_received_ = false;
+    pending_result_ = {};
+    has_pending_result_ = false;
   }
 
   future_goal_handle_ = {};
-  goal_received_ = false;
 }
 
 template <class T>
