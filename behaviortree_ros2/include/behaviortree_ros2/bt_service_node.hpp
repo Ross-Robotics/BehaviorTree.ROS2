@@ -160,6 +160,7 @@ protected:
     ServiceClientInstance(std::shared_ptr<rclcpp::Node> node,
                           const std::string& service_name,
                           const std::shared_ptr<RosCallbackExecutor>& shared_executor);
+    ~ServiceClientInstance();
 
     ServiceClientPtr service_client;
     rclcpp::CallbackGroup::SharedPtr callback_group;
@@ -225,6 +226,14 @@ private:
 //----------------------------------------------------------------
 //---------------------- DEFINITIONS -----------------------------
 //----------------------------------------------------------------
+
+template <class T>
+inline RosServiceNode<T>::ServiceClientInstance::~ServiceClientInstance()
+{
+  if(shared_executor && callback_group) {
+    shared_executor->remove_callback_group(callback_group);
+  }
+}
 
 template <class T>
 inline RosServiceNode<T>::ServiceClientInstance::ServiceClientInstance(

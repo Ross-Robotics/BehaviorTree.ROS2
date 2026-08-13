@@ -57,6 +57,11 @@ public:
     executor_->add_callback_group(callback_group, node_base_interface);
   }
 
+  void remove_callback_group(const rclcpp::CallbackGroup::SharedPtr& callback_group)
+  {
+    executor_->remove_callback_group(callback_group);
+  }
+
 private:
   std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> executor_;
   std::thread thread_;

@@ -189,6 +189,7 @@ protected:
     ActionClientInstance(std::shared_ptr<rclcpp::Node> node,
                          const std::string& action_name,
                          const std::shared_ptr<RosCallbackExecutor>& shared_executor);
+    ~ActionClientInstance();
 
     ActionClientPtr action_client;
     rclcpp::CallbackGroup::SharedPtr callback_group;
@@ -265,6 +266,14 @@ private:
 //----------------------------------------------------------------
 //---------------------- DEFINITIONS -----------------------------
 //----------------------------------------------------------------
+
+template <class T>
+inline RosActionNode<T>::ActionClientInstance::~ActionClientInstance()
+{
+  if(shared_executor && callback_group) {
+    shared_executor->remove_callback_group(callback_group);
+  }
+}
 
 template <class T>
 RosActionNode<T>::ActionClientInstance::ActionClientInstance(

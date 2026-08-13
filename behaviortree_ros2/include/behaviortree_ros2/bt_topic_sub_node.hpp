@@ -56,6 +56,7 @@ protected:
       std::shared_ptr<rclcpp::Node> node,
       const std::string& topic_name,
       const std::shared_ptr<RosCallbackExecutor>& shared_executor);
+    ~SubscriberInstance();
 
     std::shared_ptr<Subscriber> subscriber;
     rclcpp::CallbackGroup::SharedPtr callback_group;
@@ -183,6 +184,14 @@ private:
 //----------------------------------------------------------------
 //---------------------- DEFINITIONS -----------------------------
 //----------------------------------------------------------------
+template <class T>
+inline RosTopicSubNode<T>::SubscriberInstance::~SubscriberInstance()
+{
+  if(shared_executor && callback_group) {
+    shared_executor->remove_callback_group(callback_group);
+  }
+}
+
 template <class T>
 inline RosTopicSubNode<T>::SubscriberInstance::SubscriberInstance(
     std::shared_ptr<rclcpp::Node> node,
