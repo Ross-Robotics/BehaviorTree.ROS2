@@ -22,7 +22,7 @@ find_path(
   BEHAVIORTREE_CPP_INCLUDE_DIR
   NAMES behaviortree_cpp/bt_factory.h
   PATHS
-    /opt/ros/humble/include
+    /opt/ros/lyrical/include
   REQUIRED
 )
 
@@ -30,9 +30,9 @@ find_library(
   BEHAVIORTREE_CPP_LIBRARY
   NAMES behaviortree_cpp
   PATHS
-    /opt/ros/humble/lib
-    /opt/ros/humble/lib/${CMAKE_LIBRARY_ARCHITECTURE}
-    /opt/ros/humble/lib/aarch64-linux-gnu
+    /opt/ros/lyrical/lib
+    /opt/ros/lyrical/lib/${CMAKE_LIBRARY_ARCHITECTURE}
+    /opt/ros/lyrical/lib/aarch64-linux-gnu
   REQUIRED
 )
 
