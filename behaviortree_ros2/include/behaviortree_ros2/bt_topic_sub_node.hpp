@@ -15,6 +15,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <rclcpp/executors.hpp>
 #include <rclcpp/allocator/allocator_common.hpp>
@@ -51,13 +52,18 @@ public:
 protected:
   struct SubscriberInstance
   {
-    SubscriberInstance(std::shared_ptr<rclcpp::Node> node, const std::string& topic_name);
+    SubscriberInstance(
+      std::shared_ptr<rclcpp::Node> node,
+      const std::string& topic_name,
+      const std::shared_ptr<RosCallbackExecutor>& shared_executor);
 
     std::shared_ptr<Subscriber> subscriber;
     rclcpp::CallbackGroup::SharedPtr callback_group;
     rclcpp::executors::SingleThreadedExecutor callback_group_executor;
+    std::shared_ptr<RosCallbackExecutor> shared_executor;
     boost::signals2::signal<void(const std::shared_ptr<TopicT>)> broadcaster;
     std::shared_ptr<TopicT> last_msg;
+    mutable std::mutex last_msg_mutex;
   };
 
   static std::mutex& registryMutex()
@@ -79,9 +85,12 @@ protected:
   std::weak_ptr<rclcpp::Node> node_;
   std::shared_ptr<SubscriberInstance> sub_instance_;
   std::shared_ptr<TopicT> last_msg_;
+  mutable std::mutex last_msg_mutex_;
   std::string topic_name_;
   boost::signals2::connection signal_connection_;
   std::string subscriber_key_;
+  RosCallbackExecutionMode callback_execution_mode_;
+  std::shared_ptr<RosCallbackExecutor> callback_executor_;
 
   rclcpp::Logger logger()
   {
@@ -176,20 +185,30 @@ private:
 //----------------------------------------------------------------
 template <class T>
 inline RosTopicSubNode<T>::SubscriberInstance::SubscriberInstance(
-    std::shared_ptr<rclcpp::Node> node, const std::string& topic_name)
+    std::shared_ptr<rclcpp::Node> node,
+    const std::string& topic_name,
+    const std::shared_ptr<RosCallbackExecutor>& shared_executor)
 {
   // create a callback group for this particular instance
   callback_group =
       node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
-  callback_group_executor.add_callback_group(callback_group,
-                                             node->get_node_base_interface());
+  this->shared_executor = shared_executor;
+  if(this->shared_executor) {
+    this->shared_executor->add_callback_group(callback_group, node->get_node_base_interface());
+  } else {
+    callback_group_executor.add_callback_group(callback_group,
+                                               node->get_node_base_interface());
+  }
 
   rclcpp::SubscriptionOptions option;
   option.callback_group = callback_group;
 
   // The callback will broadcast to all the instances of RosTopicSubNode<T>
   auto callback = [this](const std::shared_ptr<T> msg) {
-    last_msg = msg;
+    {
+      std::lock_guard<std::mutex> lock(last_msg_mutex);
+      last_msg = msg;
+    }
     broadcaster(msg);
   };
   rclcpp::QoS qos_local(rclcpp::KeepLast(1));
@@ -202,7 +221,10 @@ template <class T>
 inline RosTopicSubNode<T>::RosTopicSubNode(const std::string& instance_name,
                                            const NodeConfig& conf,
                                            const RosNodeParams& params)
-  : BT::ConditionNode(instance_name, conf), node_(params.nh)
+  : BT::ConditionNode(instance_name, conf)
+  , node_(params.nh)
+  , callback_execution_mode_(params.callback_execution_mode)
+  , callback_executor_(params.callback_executor)
 {
   // check port remapping
   auto portIt = config().input_ports.find("topic_name");
@@ -270,13 +292,25 @@ inline bool RosTopicSubNode<T>::createSubscriber(const std::string& topic_name)
     throw RuntimeError("The ROS node went out of scope. RosNodeParams doesn't take the "
                        "ownership of the node.");
   }
+  if(callback_execution_mode_ == RosCallbackExecutionMode::SharedExecutor &&
+     !callback_executor_)
+  {
+    throw RuntimeError(
+      "SharedExecutor callback mode requires RosNodeParams::callback_executor.");
+  }
   subscriber_key_ = std::string(node->get_fully_qualified_name()) + "/" + topic_name;
+  if(callback_execution_mode_ == RosCallbackExecutionMode::SharedExecutor) {
+    subscriber_key_ += "/shared_executor";
+  }
 
   auto& registry = getRegistry();
   auto it = registry.find(subscriber_key_);
   if(it == registry.end())
   {
-    sub_instance_ = std::make_shared<SubscriberInstance>(node, topic_name);
+    const auto shared_executor =
+      callback_execution_mode_ == RosCallbackExecutionMode::SharedExecutor ?
+      callback_executor_ : std::shared_ptr<RosCallbackExecutor>();
+    sub_instance_ = std::make_shared<SubscriberInstance>(node, topic_name, shared_executor);
     registry.insert({ subscriber_key_, sub_instance_ });
 
     RCLCPP_INFO(logger(), "Node [%s] created Subscriber to topic [%s]", name().c_str(),
@@ -288,14 +322,20 @@ inline bool RosTopicSubNode<T>::createSubscriber(const std::string& topic_name)
   }
 
   // Check if there was a message received before the creation of this subscriber action
-  if(sub_instance_->last_msg)
   {
-    last_msg_ = sub_instance_->last_msg;
+    std::lock_guard<std::mutex> lock(sub_instance_->last_msg_mutex);
+    if(sub_instance_->last_msg) {
+      std::lock_guard<std::mutex> node_lock(last_msg_mutex_);
+      last_msg_ = sub_instance_->last_msg;
+    }
   }
 
   // add "this" as received of the broadcaster
   signal_connection_ = sub_instance_->broadcaster.connect(
-      [this](const std::shared_ptr<T> msg) { last_msg_ = msg; });
+      [this](const std::shared_ptr<T> msg) {
+        std::lock_guard<std::mutex> lock(last_msg_mutex_);
+        last_msg_ = msg;
+      });
 
   topic_name_ = topic_name;
   return true;
@@ -329,11 +369,22 @@ inline NodeStatus RosTopicSubNode<T>::tick()
     }
     return status;
   };
-  sub_instance_->callback_group_executor.spin_some();
-  auto status = CheckStatus(onTick(last_msg_));
+  if(callback_execution_mode_ != RosCallbackExecutionMode::SharedExecutor)
+  {
+    sub_instance_->callback_group_executor.spin_some();
+  }
+  std::shared_ptr<T> message;
+  {
+    std::lock_guard<std::mutex> lock(last_msg_mutex_);
+    message = last_msg_;
+  }
+  auto status = CheckStatus(onTick(message));
   if(!latchLastMessage())
   {
-    last_msg_.reset();
+    std::lock_guard<std::mutex> lock(last_msg_mutex_);
+    if(last_msg_ == message) {
+      last_msg_.reset();
+    }
   }
   return status;
 }

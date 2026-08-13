@@ -15,16 +15,62 @@
 #pragma once
 
 #include <rclcpp/rclcpp.hpp>
-#include <string>
 #include <chrono>
 #include <memory>
+#include <string>
+#include <thread>
 
 namespace BT
 {
 
+enum class RosCallbackExecutionMode
+{
+  Legacy,
+  ReducedPolling,
+  SharedExecutor
+};
+
+class RosCallbackExecutor
+{
+public:
+  RosCallbackExecutor()
+  : executor_(std::make_shared<rclcpp::executors::SingleThreadedExecutor>())
+  {
+    thread_ = std::thread([this]() { executor_->spin(); });
+  }
+
+  ~RosCallbackExecutor()
+  {
+    executor_->cancel();
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+  RosCallbackExecutor(const RosCallbackExecutor&) = delete;
+  RosCallbackExecutor& operator=(const RosCallbackExecutor&) = delete;
+
+  void add_callback_group(
+    const rclcpp::CallbackGroup::SharedPtr& callback_group,
+    const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr& node_base_interface)
+  {
+    executor_->add_callback_group(callback_group, node_base_interface);
+  }
+
+private:
+  std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> executor_;
+  std::thread thread_;
+};
+
 struct RosNodeParams
 {
   std::weak_ptr<rclcpp::Node> nh;
+
+  // Preserve the existing private-executor polling behavior by default.
+  RosCallbackExecutionMode callback_execution_mode = RosCallbackExecutionMode::Legacy;
+
+  // Used only by SharedExecutor mode. The owner controls its lifetime.
+  std::shared_ptr<RosCallbackExecutor> callback_executor;
 
   // This has different meaning based on the context:
   //

@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <future>
 #include <memory>
 #include <string>
 #include <rclcpp/executors.hpp>
@@ -157,11 +158,13 @@ protected:
   struct ServiceClientInstance
   {
     ServiceClientInstance(std::shared_ptr<rclcpp::Node> node,
-                          const std::string& service_name);
+                          const std::string& service_name,
+                          const std::shared_ptr<RosCallbackExecutor>& shared_executor);
 
     ServiceClientPtr service_client;
     rclcpp::CallbackGroup::SharedPtr callback_group;
     rclcpp::executors::SingleThreadedExecutor callback_executor;
+    std::shared_ptr<RosCallbackExecutor> shared_executor;
   };
 
   static std::mutex& getMutex()
@@ -201,6 +204,8 @@ protected:
   std::shared_ptr<ServiceClientInstance> srv_instance_ = nullptr;
   std::string service_name_;
   bool service_name_may_change_ = false;
+  RosCallbackExecutionMode callback_execution_mode_;
+  std::shared_ptr<RosCallbackExecutor> callback_executor_;
   std::chrono::milliseconds service_timeout_;
   const std::chrono::milliseconds wait_for_service_timeout_;
   std::string service_client_key_;
@@ -223,11 +228,18 @@ private:
 
 template <class T>
 inline RosServiceNode<T>::ServiceClientInstance::ServiceClientInstance(
-    std::shared_ptr<rclcpp::Node> node, const std::string& service_name)
+    std::shared_ptr<rclcpp::Node> node,
+    const std::string& service_name,
+    const std::shared_ptr<RosCallbackExecutor>& shared_executor)
 {
   callback_group =
       node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
-  callback_executor.add_callback_group(callback_group, node->get_node_base_interface());
+  this->shared_executor = shared_executor;
+  if (this->shared_executor) {
+    this->shared_executor->add_callback_group(callback_group, node->get_node_base_interface());
+  } else {
+    callback_executor.add_callback_group(callback_group, node->get_node_base_interface());
+  }
 
   service_client = node->create_client<T>(service_name, rmw_qos_profile_services_default,
                                           callback_group);
@@ -239,6 +251,8 @@ inline RosServiceNode<T>::RosServiceNode(const std::string& instance_name,
                                          const RosNodeParams& params)
   : BT::ActionNodeBase(instance_name, conf)
   , node_(params.nh)
+  , callback_execution_mode_(params.callback_execution_mode)
+  , callback_executor_(params.callback_executor)
   , service_timeout_(params.server_timeout)
   , wait_for_service_timeout_(params.wait_for_server_timeout)
 {
@@ -302,13 +316,27 @@ inline bool RosServiceNode<T>::createClient(const std::string& service_name)
     throw RuntimeError("The ROS node went out of scope. RosNodeParams doesn't take the "
                        "ownership of the node.");
   }
+  if(callback_execution_mode_ == RosCallbackExecutionMode::SharedExecutor &&
+     !callback_executor_)
+  {
+    throw RuntimeError(
+      "SharedExecutor callback mode requires RosNodeParams::callback_executor.");
+  }
   service_client_key_ = std::string(node->get_fully_qualified_name()) + "/" + service_name;
+
+  if(callback_execution_mode_ == RosCallbackExecutionMode::SharedExecutor) {
+    service_client_key_ += "/shared_executor";
+  }
 
   auto& registry = getRegistry();
   auto it = registry.find(service_client_key_);
   if(it == registry.end())
   {
-    srv_instance_ = std::make_shared<ServiceClientInstance>(node, service_name);
+    const auto shared_executor =
+      callback_execution_mode_ == RosCallbackExecutionMode::SharedExecutor ?
+      callback_executor_ : std::shared_ptr<RosCallbackExecutor>();
+    srv_instance_ = std::make_shared<ServiceClientInstance>(
+      node, service_name, shared_executor);
     registry.insert({ service_client_key_, srv_instance_ });
 
     RCLCPP_INFO(logger(), "Node [%s] created service client [%s]", name().c_str(),
@@ -383,19 +411,32 @@ inline NodeStatus RosServiceNode<T>::tick()
 
   if(status() == NodeStatus::RUNNING)
   {
-    srv_instance_->callback_executor.spin_some();
+    if(callback_execution_mode_ == RosCallbackExecutionMode::Legacy)
+    {
+      srv_instance_->callback_executor.spin_some();
+    }
 
     // FIRST case: check if the goal request has a timeout
     if(!response_received_)
     {
-      auto const nodelay = std::chrono::milliseconds(0);
       auto const timeout =
           rclcpp::Duration::from_seconds(double(service_timeout_.count()) / 1000);
 
-      auto ret = srv_instance_->callback_executor.spin_until_future_complete(
-          future_response_, nodelay);
+      bool response_ready = false;
+      if(callback_execution_mode_ == RosCallbackExecutionMode::SharedExecutor)
+      {
+        response_ready =
+          future_response_.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+      }
+      else
+      {
+        auto const nodelay = std::chrono::milliseconds(0);
+        response_ready =
+          srv_instance_->callback_executor.spin_until_future_complete(
+          future_response_, nodelay) == rclcpp::FutureReturnCode::SUCCESS;
+      }
 
-      if(ret != rclcpp::FutureReturnCode::SUCCESS)
+      if(!response_ready)
       {
         if((now() - time_request_sent_) > timeout)
         {

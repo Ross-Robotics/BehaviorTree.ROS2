@@ -15,7 +15,10 @@
 
 #pragma once
 
+#include <deque>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <rclcpp/executors.hpp>
 #include <rclcpp/allocator/allocator_common.hpp>
@@ -184,11 +187,13 @@ protected:
   struct ActionClientInstance
   {
     ActionClientInstance(std::shared_ptr<rclcpp::Node> node,
-                         const std::string& action_name);
+                         const std::string& action_name,
+                         const std::shared_ptr<RosCallbackExecutor>& shared_executor);
 
     ActionClientPtr action_client;
     rclcpp::CallbackGroup::SharedPtr callback_group;
     rclcpp::executors::SingleThreadedExecutor callback_executor;
+    std::shared_ptr<RosCallbackExecutor> shared_executor;
     typename ActionClient::SendGoalOptions goal_options;
   };
 
@@ -229,6 +234,8 @@ protected:
   std::shared_ptr<ActionClientInstance> client_instance_;
   std::string action_name_;
   bool action_name_may_change_ = false;
+  RosCallbackExecutionMode callback_execution_mode_;
+  std::shared_ptr<RosCallbackExecutor> callback_executor_;
   std::chrono::milliseconds server_timeout_;
   const std::chrono::milliseconds wait_for_server_timeout_;
   std::string action_client_key_;
@@ -243,6 +250,8 @@ private:
   WrappedResult result_;
   WrappedResult pending_result_;   // holds a result that arrived before goal_handle_ was set
   bool has_pending_result_ = false;
+  bool cancellation_requested_ = false;
+  std::deque<std::shared_ptr<const Feedback>> pending_feedback_;
   // Single mutex protecting goal_handle_, goal_received_, result_, pending_result_, and
   // has_pending_result_ together. They form one state machine, so one lock avoids
   // ordering issues and ensures consistent snapshots when reading in tick().
@@ -259,11 +268,18 @@ private:
 
 template <class T>
 RosActionNode<T>::ActionClientInstance::ActionClientInstance(
-    std::shared_ptr<rclcpp::Node> node, const std::string& action_name)
+    std::shared_ptr<rclcpp::Node> node,
+    const std::string& action_name,
+    const std::shared_ptr<RosCallbackExecutor>& shared_executor)
 {
   callback_group =
       node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-  callback_executor.add_callback_group(callback_group, node->get_node_base_interface());
+  this->shared_executor = shared_executor;
+  if(this->shared_executor) {
+    this->shared_executor->add_callback_group(callback_group, node->get_node_base_interface());
+  } else {
+    callback_executor.add_callback_group(callback_group, node->get_node_base_interface());
+  }
   action_client = rclcpp_action::create_client<T>(node, action_name, callback_group);
 }
 
@@ -273,6 +289,8 @@ inline RosActionNode<T>::RosActionNode(const std::string& instance_name,
                                        const RosNodeParams& params)
   : BT::ActionNodeBase(instance_name, conf)
   , node_(params.nh)
+  , callback_execution_mode_(params.callback_execution_mode)
+  , callback_executor_(params.callback_executor)
   , server_timeout_(params.server_timeout)
   , wait_for_server_timeout_(params.wait_for_server_timeout)
 {
@@ -341,13 +359,26 @@ inline bool RosActionNode<T>::createClient(const std::string& action_name)
     throw RuntimeError("The ROS node went out of scope. RosNodeParams doesn't take the "
                        "ownership of the node.");
   }
+  if(callback_execution_mode_ == RosCallbackExecutionMode::SharedExecutor &&
+     !callback_executor_)
+  {
+    throw RuntimeError(
+      "SharedExecutor callback mode requires RosNodeParams::callback_executor.");
+  }
   action_client_key_ = std::string(node->get_fully_qualified_name()) + "/" + action_name;
+  if(callback_execution_mode_ == RosCallbackExecutionMode::SharedExecutor) {
+    action_client_key_ += "/shared_executor";
+  }
 
   auto& registry = getRegistry();
   auto it = registry.find(action_client_key_);
   if(it == registry.end())
   {
-    client_instance_ = std::make_shared<ActionClientInstance>(node, action_name);
+    const auto shared_executor =
+      callback_execution_mode_ == RosCallbackExecutionMode::SharedExecutor ?
+      callback_executor_ : std::shared_ptr<RosCallbackExecutor>();
+    client_instance_ = std::make_shared<ActionClientInstance>(
+      node, action_name, shared_executor);
     registry.insert({ action_client_key_, client_instance_ });
 
     RCLCPP_INFO(logger(), "Node [%s] created action client [%s]", name().c_str(),
@@ -408,11 +439,13 @@ inline NodeStatus RosActionNode<T>::tick()
       result_ = {};
       pending_result_ = {};
       has_pending_result_ = false;
+      cancellation_requested_ = false;
     }
     future_goal_handle_ = {};
     {
       std::lock_guard<std::mutex> feedback_lock(on_feedback_state_change_mutex_);
       on_feedback_state_change_ = NodeStatus::RUNNING;
+      pending_feedback_.clear();
     }
 
     Goal goal;
@@ -429,10 +462,17 @@ inline NodeStatus RosActionNode<T>::tick()
         [this](typename GoalHandle::SharedPtr,
                const std::shared_ptr<const Feedback> feedback) {
           std::lock_guard<std::mutex> lock(on_feedback_state_change_mutex_);
-          on_feedback_state_change_ = onFeedback(feedback);
-          if(on_feedback_state_change_ == NodeStatus::IDLE)
+          if(callback_execution_mode_ == RosCallbackExecutionMode::SharedExecutor)
           {
-            throw std::logic_error("onFeedback must not return IDLE");
+            pending_feedback_.push_back(feedback);
+          }
+          else
+          {
+            on_feedback_state_change_ = onFeedback(feedback);
+            if(on_feedback_state_change_ == NodeStatus::IDLE)
+            {
+              throw std::logic_error("onFeedback must not return IDLE");
+            }
           }
           emitWakeUpSignal();
         };
@@ -443,26 +483,39 @@ inline NodeStatus RosActionNode<T>::tick()
     // against the accepted goal_id.
     goal_options.goal_response_callback =
         [this](typename GoalHandle::SharedPtr handle) {
+          bool should_cancel = false;
           if (handle) {
-            std::lock_guard<std::mutex> state_lock(action_state_mutex_);
-            goal_handle_ = handle;
-            goal_received_ = true;
+            {
+              std::lock_guard<std::mutex> state_lock(action_state_mutex_);
+              goal_handle_ = handle;
+              goal_received_ = true;
+              should_cancel = cancellation_requested_;
 
-            // If a result arrived before this callback (fast server abort race), validate
-            // it now that we have the goal handle and can check the goal ID.
-            if (has_pending_result_) {
-              if (pending_result_.goal_id == handle->get_goal_id()) {
-                result_ = pending_result_;
-                goal_handle_.reset();
-              } else {
-                RCLCPP_WARN(
-                  logger(),
-                  "Discarding pending early result for [%s]: goal_id does not match "
-                  "accepted goal.",
-                  action_name_.c_str());
+              // If a result arrived before this callback (fast server abort race), validate
+              // it now that we have the goal handle and can check the goal ID.
+              if (has_pending_result_) {
+                if (pending_result_.goal_id == handle->get_goal_id()) {
+                  result_ = pending_result_;
+                  goal_handle_.reset();
+                } else {
+                  RCLCPP_WARN(
+                    logger(),
+                    "Discarding pending early result for [%s]: goal_id does not match "
+                    "accepted goal.",
+                    action_name_.c_str());
+                }
+                pending_result_ = {};
+                has_pending_result_ = false;
               }
-              pending_result_ = {};
-              has_pending_result_ = false;
+            }
+            if(should_cancel) {
+              try {
+                client_instance_->action_client->async_cancel_goal(handle);
+              } catch(const std::exception& e) {
+                RCLCPP_WARN(
+                  logger(), "Failed to cancel late-accepted goal [%s]: %s",
+                  action_name_.c_str(), e.what());
+              }
             }
           }
           // If null the goal was rejected; GOAL_REJECTED_BY_SERVER is handled in tick().
@@ -546,8 +599,12 @@ inline NodeStatus RosActionNode<T>::tick()
 
   if(status() == NodeStatus::RUNNING)
   {
-    std::unique_lock<std::mutex> lock(getMutex());
-    client_instance_->callback_executor.spin_some();
+    std::unique_lock<std::mutex> lock(getMutex(), std::defer_lock);
+    if(callback_execution_mode_ != RosCallbackExecutionMode::SharedExecutor)
+    {
+      lock.lock();
+      client_instance_->callback_executor.spin_some();
+    }
 
     // FIRST case: check if the goal request has a timeout.
     // Take a snapshot under the lock so we don't race with goal_response_callback.
@@ -567,13 +624,24 @@ inline NodeStatus RosActionNode<T>::tick()
         return CheckStatus(onFailure(SEND_GOAL_TIMEOUT));
       }
 
-      auto nodelay = std::chrono::milliseconds(0);
       auto timeout =
           rclcpp::Duration::from_seconds(double(server_timeout_.count()) / 1000);
 
-      auto ret = client_instance_->callback_executor.spin_until_future_complete(
-          future_goal_handle_, nodelay);
-      if(ret != rclcpp::FutureReturnCode::SUCCESS)
+      bool goal_future_ready = false;
+      if(callback_execution_mode_ == RosCallbackExecutionMode::SharedExecutor)
+      {
+        goal_future_ready =
+          future_goal_handle_.wait_for(std::chrono::milliseconds(0)) ==
+          std::future_status::ready;
+      }
+      else
+      {
+        auto nodelay = std::chrono::milliseconds(0);
+        goal_future_ready =
+          client_instance_->callback_executor.spin_until_future_complete(
+          future_goal_handle_, nodelay) == rclcpp::FutureReturnCode::SUCCESS;
+      }
+      if(!goal_future_ready)
       {
         if((now() - time_goal_sent_) > timeout)
         {
@@ -618,6 +686,25 @@ inline NodeStatus RosActionNode<T>::tick()
         {
           return CheckStatus(onFailure(GOAL_REJECTED_BY_SERVER));
         }
+      }
+    }
+
+    if(callback_execution_mode_ == RosCallbackExecutionMode::SharedExecutor)
+    {
+      std::deque<std::shared_ptr<const Feedback>> feedback_queue;
+      {
+        std::lock_guard<std::mutex> feedback_lock(on_feedback_state_change_mutex_);
+        feedback_queue.swap(pending_feedback_);
+      }
+      for(const auto& feedback : feedback_queue)
+      {
+        const auto feedback_status = onFeedback(feedback);
+        if(feedback_status == NodeStatus::IDLE)
+        {
+          throw std::logic_error("onFeedback must not return IDLE");
+        }
+        std::lock_guard<std::mutex> feedback_lock(on_feedback_state_change_mutex_);
+        on_feedback_state_change_ = feedback_status;
       }
     }
 
@@ -681,6 +768,40 @@ inline void RosActionNode<T>::cancelGoal()
 
   auto& executor = client_instance_->callback_executor;
   auto& action_client = client_instance_->action_client;
+
+  if(callback_execution_mode_ == RosCallbackExecutionMode::SharedExecutor)
+  {
+    typename GoalHandle::SharedPtr local_goal_handle;
+    {
+      std::lock_guard<std::mutex> state_lock(action_state_mutex_);
+      cancellation_requested_ = true;
+      local_goal_handle = goal_handle_;
+    }
+
+    if(!local_goal_handle && future_goal_handle_.valid() &&
+       future_goal_handle_.wait_for(std::chrono::milliseconds(0)) ==
+       std::future_status::ready)
+    {
+      local_goal_handle = future_goal_handle_.get();
+      future_goal_handle_ = {};
+    }
+
+    if(local_goal_handle)
+    {
+      try {
+        action_client->async_cancel_goal(local_goal_handle);
+      } catch(const std::exception& e) {
+        RCLCPP_WARN(
+          logger(), "cancelGoal for [%s] failed: %s", action_name_.c_str(), e.what());
+      }
+    }
+    else if(future_goal_handle_.valid())
+    {
+      future_goal_handle_ = {};
+    }
+
+    return;
+  }
 
   // If we already have a terminal result, there is nothing left to cancel.
   {

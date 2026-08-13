@@ -10,10 +10,13 @@ set(THIS_PACKAGE_DEPS
     ament_index_cpp
     behaviortree_cpp
     btcpp_ros2_interfaces
+    std_msgs
+    std_srvs
     generate_parameter_library
     )
 
 find_package(ament_cmake REQUIRED)
+find_package(Threads REQUIRED)
 
 foreach(PACKAGE ${THIS_PACKAGE_DEPS})
     find_package(${PACKAGE} REQUIRED )
@@ -55,5 +58,31 @@ install(
 
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME})
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(
+    test_ros_node_params
+    test/test_ros_node_params.cpp
+    test/test_ros_service_callback_modes.cpp)
+  target_include_directories(test_ros_node_params PRIVATE include)
+  ament_target_dependencies(test_ros_node_params rclcpp behaviortree_cpp std_srvs)
+  target_link_libraries(test_ros_node_params Threads::Threads)
+
+  ament_add_gtest(test_ros_topic_callback_modes test/test_ros_topic_callback_modes.cpp)
+  target_include_directories(test_ros_topic_callback_modes PRIVATE include)
+  ament_target_dependencies(test_ros_topic_callback_modes rclcpp behaviortree_cpp std_msgs)
+  target_link_libraries(test_ros_topic_callback_modes Threads::Threads)
+
+  ament_add_gtest(test_ros_action_callback_modes test/test_ros_action_callback_modes.cpp)
+  target_include_directories(test_ros_action_callback_modes PRIVATE include)
+  ament_target_dependencies(
+    test_ros_action_callback_modes
+    rclcpp
+    rclcpp_action
+    behaviortree_cpp
+    btcpp_ros2_interfaces)
+  target_link_libraries(test_ros_action_callback_modes Threads::Threads)
+endif()
 
 ament_package()
