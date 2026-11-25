@@ -533,9 +533,9 @@ inline NodeStatus RosActionNode<T>::tick()
   };
     //--------------------
     // Check if server is ready
-    if(!action_client->action_server_is_ready())
+    if(!checkActionClient())
     {
-      return onFailure(SERVER_UNREACHABLE);
+      return CheckStatus(onFailure(SERVER_UNREACHABLE));
     }
 
     future_goal_handle_ = action_client->async_send_goal(goal, goal_options);
@@ -547,7 +547,13 @@ inline NodeStatus RosActionNode<T>::tick()
   if(status() == NodeStatus::RUNNING)
   {
     std::unique_lock<std::mutex> lock(getMutex());
-    client_instance_->callback_executor.spin_some();
+    // Drain everything that is queued for this action client. In Humble the
+    // action client hands over ONE message per wait, always preferring feedback
+    // and status over the goal response, so spin_some() processes a single
+    // message per tick and a busy feedback stream can starve the goal response
+    // until SEND_GOAL_TIMEOUT fires. spin_all() keeps going until nothing is
+    // ready (bounded so a flood can't stall the tick).
+    client_instance_->callback_executor.spin_all(std::chrono::milliseconds(20));
 
     // FIRST case: check if the goal request has a timeout.
     // Take a snapshot under the lock so we don't race with goal_response_callback.
